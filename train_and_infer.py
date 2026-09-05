@@ -16,7 +16,59 @@ not attempted here.
 """
 
 import math
+import os
+
+import numpy as np
 import torch
+
+# Optional compiled kernel for the correspondence DP. The Python loop below is
+# the readable reference and stays the fallback; measured at M=60, N=188 -- a
+# typical fragment -- it costs 42 ms, so ~337 ms of every batch of 8 is spent
+# here, against a step time of ~2.3 s with the GPU at 12-25%. The E-step, not
+# the network, is what training waits on.
+#
+# AlignBeat's own dp.py has a kernel for the same problem, but its recursion
+# has NO skip cost: it is min over j' <= j of D[i-1,j'-1] + cost, which
+# np.minimum.accumulate solves in one vectorised pass. Eq. (23) charges
+# L_agree(j) on the skip branch, so that running-minimum trick does not apply
+# and the loop below is scalar rather than a copy of theirs.
+#
+# ALIGNBEAT_NO_NUMBA=1 forces the Python path, so the two can be A/B'd; they
+# must agree exactly.
+try:
+    from numba import njit as _njit
+
+    @_njit(cache=True, fastmath=False)
+    def _dp_kernel(cost, agree, choice):
+        M, N = cost.shape
+        INF = np.inf
+        previous = np.empty(N + 1, dtype=np.float64)   # row i-1
+        current = np.empty(N + 1, dtype=np.float64)    # row i
+
+        # Row 0: no event matched yet, so the first j candidates were all
+        # skipped and each owes its own L_agree(j) -- a prefix sum.
+        previous[0] = 0.0
+        for j in range(1, N + 1):
+            previous[j] = previous[j - 1] + agree[j - 1]
+
+        for i in range(1, M + 1):
+            current[0] = INF
+            for j in range(1, N + 1):
+                c_skip = current[j - 1] + agree[j - 1]
+                c_match = previous[j - 1] + cost[i - 1, j - 1]
+                if c_match < c_skip:
+                    current[j] = c_match
+                    choice[i, j] = 1          # match
+                else:
+                    current[j] = c_skip
+                    choice[i, j] = 0          # skip
+            for j in range(N + 1):
+                previous[j] = current[j]
+        return previous[N]
+
+    _HAVE_NUMBA = not os.environ.get("ALIGNBEAT_NO_NUMBA")
+except ImportError:                                          # pragma: no cover
+    _HAVE_NUMBA = False
 
 import config
 
@@ -50,20 +102,25 @@ def l_agree(hat_phi: torch.Tensor, t_true: torch.Tensor, phi_true: torch.Tensor,
     Only meaningful when phi_true is fully known (ind=0) -- see the
     document's own resolution of the ind=1 circularity concern.
     Returns an (N,) tensor, one value per candidate."""
-    N = hat_t.shape[0]
     M = t_true.shape[0]
-    out = torch.zeros(N, device=hat_phi.device, dtype=hat_phi.dtype)
-    for j in range(N):
-        tj = hat_t[j].item()
-        # find the bracketing ground-truth pair (i, i+1) with t_i <= tj <= t_{i+1}
-        i = torch.searchsorted(t_true, hat_t[j].detach()).item()
-        i = max(1, min(i, M - 1))  # clamp into a valid bracket
-        t_i, t_i1 = t_true[i - 1], t_true[i]
-        phi_i, phi_i1 = phi_true[i - 1], phi_true[i]
-        w = (tj - t_i.item()) / max(t_i1.item() - t_i.item(), 1e-8)
-        target = (phi_i + w * (phi_i1 - phi_i)) % 1.0
-        out[j] = circ_dist(hat_phi[j], target.detach())
-    return out
+
+    # Vectorised over candidates. The scalar loop this replaces called
+    # torch.searchsorted and .item() once per candidate, which cost 7.3 ms per
+    # fragment -- ~59 ms of every batch of 8, on top of the DP's own 337 ms.
+    # Same arithmetic, same clamping into a valid bracket, same StopGradient on
+    # the target: gradient still reaches hat_phi alone, never hat_t.
+    idx = torch.searchsorted(t_true, hat_t.detach().contiguous())
+    idx = idx.clamp(1, max(M - 1, 1))
+
+    t_i = t_true[idx - 1]
+    t_i1 = t_true[idx]
+    phi_i = phi_true[idx - 1]
+    phi_i1 = phi_true[idx]
+
+    span = (t_i1 - t_i).clamp_min(1e-8)
+    w = (hat_t.detach() - t_i) / span
+    target = (phi_i + w * (phi_i1 - phi_i)) % 1.0
+    return circ_dist(hat_phi, target.detach())
 
 
 def subset_select_dp(cost: torch.Tensor, agree: torch.Tensor | None = None):
@@ -74,6 +131,23 @@ def subset_select_dp(cost: torch.Tensor, agree: torch.Tensor | None = None):
     Returns hat_sigma as a length-M LongTensor of 1-indexed candidate
     positions (hat_sigma[i] = j means event i matched to candidate j)."""
     M, N = cost.shape
+
+    if _HAVE_NUMBA:
+        cost_np = np.ascontiguousarray(cost.detach().cpu().numpy(), dtype=np.float64)
+        agree_np = (np.ascontiguousarray(agree.detach().cpu().numpy(), dtype=np.float64)
+                    if agree is not None else np.zeros(N, dtype=np.float64))
+        choice = np.zeros((M + 1, N + 1), dtype=np.int8)
+        _dp_kernel(cost_np, agree_np, choice)
+        hat_sigma = [0] * M
+        i, j = M, N
+        while i > 0:
+            if choice[i, j] == 1:
+                hat_sigma[i - 1] = j
+                i, j = i - 1, j - 1
+            else:
+                j -= 1
+        return torch.tensor(hat_sigma, dtype=torch.long, device=cost.device)
+
     INF = float("inf")
     D = [[0.0] * (N + 1) for _ in range(M + 1)]
     choice = [[None] * (N + 1) for _ in range(M + 1)]
@@ -153,8 +227,8 @@ def e_step(t_true: torch.Tensor, hat_t: torch.Tensor, hat_phi: torch.Tensor,
         # used is simply restricted to the candidates sigma-hat left unmatched.
         # It still carries gradient into hat_phi (l_agree detaches its own target),
         # which is the direction Section 2.4 requires.
-        unmatched = [j for j in range(1, hat_t.shape[0] + 1)
-                     if j not in hat_sigma.tolist()]
+        matched = set(hat_sigma.tolist())          # built once, not per candidate
+        unmatched = [j for j in range(1, hat_t.shape[0] + 1) if j not in matched]
         if unmatched:
             unmatched_idx = torch.tensor(unmatched, dtype=torch.long) - 1
             agree_unmatched = agree[unmatched_idx]
@@ -168,7 +242,8 @@ def e_step(t_true: torch.Tensor, hat_t: torch.Tensor, hat_phi: torch.Tensor,
         hat_sigma = hat_sigma.detach()
         _, phi_i = hard_phi0(hat_sigma, hat_phi.detach(), L, lambda_phi,
                              pi_L.to(hat_phi.device))
-        unmatched = [j for j in range(1, hat_t.shape[0] + 1) if j not in hat_sigma.tolist()]
+        matched = set(hat_sigma.tolist())          # built once, not per candidate
+        unmatched = [j for j in range(1, hat_t.shape[0] + 1) if j not in matched]
         if unmatched:
             unmatched_idx = torch.tensor(unmatched) - 1
             agree = l_agree(hat_phi[unmatched_idx], t_true, phi_i, hat_t[unmatched_idx])
