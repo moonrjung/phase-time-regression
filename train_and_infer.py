@@ -268,7 +268,7 @@ def training_loop(model, dataset, n_epochs: int = config.MAX_EPOCHS,
 
 def fit_ell(hat_phi: torch.Tensor, ell: int) -> torch.Tensor:
     """eq. (fitell): fit(ell) = sum_j min_k d_circ(hat_phi_j, k/ell)."""
-    grid = torch.arange(ell, dtype=torch.float32) / ell  # (ell,)
+    grid = torch.arange(ell, dtype=hat_phi.dtype, device=hat_phi.device) / ell  # (ell,)
     d = circ_dist(hat_phi[:, None], grid[None, :])         # (N, ell)
     return d.min(dim=1).values.sum()
 
@@ -280,7 +280,8 @@ def infer_meter(hat_phi: torch.Tensor, candidate_meters: list[int],
     N = hat_phi.shape[0]
     best_score, best_ell = float("inf"), candidate_meters[0]
     for idx, ell in enumerate(candidate_meters):
-        score = fit_ell(hat_phi, ell).item() - N / (4 * ell) - (1.0 / lambda_phi) * math.log(pi_M[idx].item() + 1e-12)
+        score = (fit_ell(hat_phi, ell).item() - N / (4 * ell)
+                 - (1.0 / lambda_phi) * math.log(float(pi_M[idx]) + 1e-12))
         if score < best_score:
             best_score, best_ell = score, ell
     return best_ell

@@ -25,6 +25,9 @@ and `atan2` maps it to `[0,1)`, so its computation needs no meter at all.
 | `pl_module.py` | `PLPhaseTimeRegression`, the Lightning module |
 | `train.py` | launch script (Beat This!'s `BeatDataModule`, augmentation, Trainer) |
 | `config.py` | every hyperparameter, each with the source it came from |
+| `evaluate.py` | score checkpoints on whole held-out pieces with mir_eval |
+| `stitching.py` | whole-piece decoding: fragment offsets, keep regions, reassembly |
+| `oracle_check.py` | positive control: a perfect model must score 1.0 through `evaluate.py` |
 | `backbone.py`, `roformer.py` | Beat This!'s encoder, vendored (MIT) |
 | `downsample.py` | `T → N` candidate downsampling, vendored |
 
@@ -39,6 +42,11 @@ and `data/annotations/` — and its `beat_this` package importable for
 
 ```bash
 python train.py --name phase --gpu 0 --fold 0 --num-workers 8
+```
+
+```bash
+python evaluate.py --checkpoints "checkpoints/phase*.ckpt" --fold 0 --per-dataset
+python oracle_check.py     # must print 1.0000 for recall and precision
 ```
 
 `train_and_infer.py` runs standalone with no data at all: it checks the DP
@@ -65,9 +73,10 @@ Not implemented, and not stubbed:
   Viterbi EM.
 - **The joint `(σ, φ₀)` recursion** (eqs. 43, 44). The E-step is the phase-blind
   scheme, whose costs §3.3–3.4 work through in detail.
-- **Metrics.** Validation reports loss only. Beat/downbeat F-measure needs §5's
-  decode run over the validation set; the dense head's postprocessor would score
-  a different model's output.
+- **Metrics during training.** Validation logs loss only. Use `evaluate.py`
+  on the checkpoints instead: it decodes whole held-out pieces through §5 and
+  Algorithm 10 and scores them with mir_eval at the same 70 ms tolerance and 5 s
+  trim as the rest of the pipeline, so its numbers are directly comparable.
 - **`π̂_L`** (eq. 25) is uniform rather than estimated from the fully-labeled
   corpus.
 
