@@ -123,10 +123,20 @@ LAMBDA_R = 0.0
 # timing spread". Converted into this document's units, where t_i is normalized
 # to [0, 1] across the fragment rather than measured in seconds.
 B_0 = F_MEASURE_TOLERANCE / WINDOW_SECONDS   # 0.07 s / 30 s = 0.002333
-B_MIN = 1e-3 * B_0                            # floor, kept well below b_0 itself
+B_MIN = 1e-4                                  # alignbeat/criterion.py:24, same units (window fraction)
 
-# Epochs before ScaleHead takes over (eq. 51's E_0). AlignBeat's own warmup is
-# 1000 optimizer STEPS on the learning rate, a different quantity on different
-# units, so it cannot be copied across directly; 5 epochs is this document's
-# placeholder and, like lambda_phi, wants its own sweep.
-WARMUP_EPOCHS = 5
+# eps-insensitive timing (alignbeat/criterion.py:30, eps_l1): residuals inside
+# the 70 ms tolerance cost nothing, so they cannot drive b_e toward zero.
+EPS = F_MEASURE_TOLERANCE / WINDOW_SECONDS    # == B_0
+# AlignBeat's third piece, the Gamma prior on 1/b (_precision_prior), is
+# deliberately not carried over: the two terms above already bound the loss.
+
+# Warm-start length for the scale (eq. 51's E_0), as AlignBeat sets it: the
+# precision head is held for the first 30% of the run
+# (beat_this/model/pl_module.py:347, `current_epoch < max_epochs * 0.3`), so
+# E_0 scales with --max-epochs rather than being a fixed epoch count.
+# train.py derives E_0 = int(WARMUP_FRACTION * max_epochs) from
+# --scale-warmup-fraction; WARMUP_EPOCHS below is only the constructor
+# default for HybridBeatTracker when it is built outside train.py.
+WARMUP_FRACTION = 0.3
+WARMUP_EPOCHS = int(WARMUP_FRACTION * MAX_EPOCHS)   # 30 for the default 100 epochs

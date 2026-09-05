@@ -61,7 +61,12 @@ def load_model(ckpt_path, device):
         hp = {k: v for k, v in hp.items() if k in accepted}
 
     model = PLPhaseTimeRegression(**hp)
-    missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
+    # train.py --compile wraps parts in torch.compile, which inserts
+    # "_orig_mod." into every key of that part; strip it, as beat_this's own
+    # loader does (beat_tracker.py:196).
+    state_dict = {k.replace("._orig_mod.", ".").removeprefix("_orig_mod."): v
+                  for k, v in ckpt["state_dict"].items()}
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"    !! {len(missing)} weights absent from this checkpoint: "
               f"{missing[:4]} -- the architecture has changed, so scores would be "

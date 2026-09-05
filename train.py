@@ -140,7 +140,9 @@ def main(args):
                  "transformer": args.transformer_dropout},
         fragment_frames=args.train_length,
         b_0=args.b_0,
-        warmup_epochs=args.scale_warmup_epochs,
+        warmup_epochs=int(args.scale_warmup_fraction * args.max_epochs),
+
+        
     )
 
     if args.compile:
@@ -252,8 +254,11 @@ def build_parser():
     parser.add_argument("--b_0", type=float, default=config.B_0,
                         help="eq. (51): fixed timing scale during warm-start, in "
                              "normalized [0,1] fragment time")
-    parser.add_argument("--scale-warmup-epochs", type=int, default=config.WARMUP_EPOCHS,
-                        help="eq. (51)'s E_0: epochs before ScaleHead takes over from b_0")
+    parser.add_argument("--scale-warmup-fraction", type=float, default=config.WARMUP_FRACTION,
+                    help="eq. (51)'s E_0 as a fraction of --max-epochs, "
+                         "as AlignBeat does (30%% of the run)")
+
+    
     parser.add_argument("--beat-only-meter", type=int, default=4,
                         help="meter assumed for beat-only (ind=1) fragments, pending "
                              "MixedMeterTarget (Algorithm 1)")

@@ -88,11 +88,30 @@ def match_cost_matrix(t_true: torch.Tensor, phi_true: torch.Tensor,
     phase_blind=True: timing only (t_true, phi_true unused for phase term).
     phase_blind=False: timing + circular phase (phi_true must be given)."""
     M, N = t_true.shape[0], hat_t.shape[0]
-    timing = torch.abs(t_true[:, None] - hat_t[None, :]) / b_e  # (M, N)
+    timing = eps_l1(hat_t[None, :], t_true[:, None], b_e)  # (M, N)
     if phase_blind:
         return timing
     phase = lambda_phi * circ_dist(phi_true[:, None], hat_phi[None, :])  # (M, N)
     return timing + phase
+
+
+def eps_l1(t_hat: torch.Tensor, t_target: torch.Tensor, b: torch.Tensor,
+           eps: float = config.EPS) -> torch.Tensor:
+    """alignbeat/criterion.py:96 eps_l1 -- eps-insensitive L1, exactly zero
+    within eps of the annotation, in the window-fraction units t_hat lives in."""
+    return (t_hat - t_target).abs().sub(eps).clamp(min=0.0) / b
+
+
+def time_term(residual: torch.Tensor, b: torch.Tensor,
+              eps: float = config.EPS) -> torch.Tensor:
+    """alignbeat/criterion.py:501 _per_candidate_time_term -- -log p(r | b) for
+    the uniform-core / Laplace-tail density, gradient split so the timing
+    channel moves hat_t and the precision channel moves b. residual is already
+    eps-insensitive; log(2 eps + 2 b) is bounded below by log(2 eps), which
+    the previous M log(2 b) was not."""
+    localisation = residual / b.detach()
+    precision = residual.detach() / b + torch.log(2.0 * eps + 2.0 * b)
+    return localisation + precision
 
 
 def l_agree(hat_phi: torch.Tensor, t_true: torch.Tensor, phi_true: torch.Tensor,
@@ -258,18 +277,23 @@ def m_step_loss(hat_sigma: torch.Tensor, phi_i: torch.Tensor,
                  unmatched_agree=None, lambda_R: float = 0.0,
                  downbeat_mask: torch.Tensor | None = None) -> torch.Tensor:
     """Algorithm 5: MStep. Assembles eq. (totalloss)'s per-fragment summand:
-    matched timing+phase terms, the M log(2 b_e) scale-restoration term,
+    matched timing+phase terms (eps-insensitive, with AlignBeat's bounded
+    log(2 eps + 2 b_e) normaliser; AlignBeat's Gamma precision prior is
+    deliberately NOT carried over),
     L_agree over unmatched candidates (if given), and the periodicity
     regularizer (if lambda_R > 0 and >=2 downbeats matched)."""
     matched_t = hat_t[hat_sigma - 1]
     matched_phi = hat_phi[hat_sigma - 1]
-    M = t_true.shape[0]
 
-    timing_term = (torch.abs(t_true - matched_t) / b_e).sum()
+    # AlignBeat's timing channel (criterion.py:213-225, _per_candidate_time_term)
+    # with the per-fragment b_e standing in for its per-candidate b_j:
+    # eps-insensitive residual and the bounded normaliser log(2 eps + 2 b_e)
+    # per event. The M log(2 b_e) of eq. (totalloss) is the eps=0 case.
+    residual = (t_true - matched_t).abs().sub(config.EPS).clamp(min=0.0)
+    timing_term = time_term(residual, b_e).sum()
     phase_term = lambda_phi * circ_dist(phi_i, matched_phi).sum()
-    scale_restore = M * torch.log(2 * b_e)
 
-    loss = timing_term + phase_term + scale_restore
+    loss = timing_term + phase_term
 
     if unmatched_agree is not None:
         _, agree_vals = unmatched_agree
