@@ -4,3 +4,9 @@ pytorch-lightning==2.6.5
 einops==0.8.2
 rotary_embedding_torch
 numpy
+
+# The dataset pipeline only: train.py imports BeatDataModule from it, and
+# nothing else here does. Not on PyPI -- install from source:
+#   pip install git+https://github.com/CPJKU/beat_this.git
+# (On the machine this was developed on it is already an editable install.)
+beat_this @ git+https://github.com/CPJKU/beat_this.git

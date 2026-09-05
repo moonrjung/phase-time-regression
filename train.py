@@ -78,9 +78,20 @@ def main(args):
         torch.backends.cuda.enable_mem_efficient_sdp(False)
         torch.backends.cuda.enable_math_sdp(False)
 
-    repo_root = Path(__file__).parent.parent
-    data_dir = repo_root / "data"
+    # This file sits at the repository root here, but the same script also runs
+    # from inside a host repo's subfolder (where it began life), so accept both
+    # rather than hardcoding one depth. --data-dir overrides either.
+    here = Path(__file__).resolve().parent
+    if args.data_dir:
+        data_dir = Path(args.data_dir)
+        repo_root = here
+    elif (here / "data").exists():
+        data_dir, repo_root = here / "data", here
+    else:
+        repo_root = here.parent
+        data_dir = repo_root / "data"
     checkpoint_dir = repo_root / "checkpoints"
+    print(f"[data] {data_dir}  (exists: {data_dir.exists()})", flush=True)
 
     augmentations = {}
     if args.tempo_augmentation:
@@ -190,6 +201,10 @@ def build_parser():
                         help="model parts to torch.compile; pass with no values to disable")
 
     # data
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Beat This! preprocessed data root, holding "
+                             "audio/spectrograms and annotations. Defaults to "
+                             "./data beside this script, else ../data.")
     parser.add_argument("--fold", type=int, default=None)
     parser.add_argument("--val", default=True, action=argparse.BooleanOptionalAction)
     parser.add_argument("--hung-data", default=False, action=argparse.BooleanOptionalAction)
