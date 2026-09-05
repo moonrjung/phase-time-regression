@@ -13,7 +13,10 @@ from pathlib import Path
 import config
 from beat_this.dataset import BeatDataModule
 from stitching import stitch_piece, fragment_offsets
-from evaluate import score
+from evaluate import metrics as _metrics
+
+def score(truth, preds):
+    return _metrics(truth, preds)
 
 FPS, D, N = 50, 1500, 188
 

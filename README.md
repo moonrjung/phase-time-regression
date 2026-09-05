@@ -45,9 +45,17 @@ python train.py --name phase --gpu 0 --fold 0 --num-workers 8
 ```
 
 ```bash
-python evaluate.py --checkpoints "checkpoints/phase*.ckpt" --fold 0 --per-dataset
+# head-to-head with the dense/subset arms, printed beside their numbers
+python evaluate.py --checkpoints "checkpoints/phase*.ckpt" --split middle \
+    --baseline ../AlignBeat/cache/bygroup_van.csv --datasets-only
+
 python oracle_check.py     # must print 1.0000 for recall and precision
 ```
+
+`--split middle` reproduces the baselines' own protocol (the middle excerpt of
+each piece, which is what `val_dataloader` serves); `--split whole` decodes
+entire pieces through the fragment stitching. The two are different
+measurements and their numbers are not interchangeable.
 
 `train_and_infer.py` runs standalone with no data at all: it checks the DP
 against brute-force enumeration over 200 seeds, exercises both E-step branches,
