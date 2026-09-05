@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+data
+data/
+checkpoints/
+lightning_logs/
+wandb/
+*.ckpt
+*.npz
+.vscode/

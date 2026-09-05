@@ -1,0 +1,6 @@
+# Versions this was developed and verified against (conda env analyze-smc).
+torch==2.7.1
+pytorch-lightning==2.6.5
+einops==0.8.2
+rotary_embedding_torch
+numpy
