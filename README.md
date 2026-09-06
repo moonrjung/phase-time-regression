@@ -94,8 +94,13 @@ Not implemented, and not stubbed:
 - **`π̂_L`** (eq. 25) is uniform rather than estimated from the fully-labeled
   corpus.
 
-Three hyperparameters have no inherited value and want their own sweep — they
-are flagged in `config.py`: `λ_φ`, `τ′`, and `E₀`.
+The loss weights are not free constants. `λ_φ = 1/b_φ` and `λ_L1 = 1/b_e` are
+the inverse scales of a wrapped-Laplace and a Laplace likelihood, both learned
+per fragment by a `ScaleHead` with its own log-scale restoration term and
+warm-started at `B_PHI_0` / `B_0`; `λ_R = 1/(2σ_R²)` with the periodicity term
+made dimensionless (a fraction of a bar) and `σ_R` measured on the training
+annotations. `config.py` records each value's derivation. What still wants a
+sweep: `B_PHI_0`, `τ′`, and `E₀`.
 
 ## Licence
 

@@ -126,8 +126,7 @@ def main(args):
         warmup_steps=args.warmup_steps,
         max_epochs=args.max_epochs,
         fps=args.fps,
-        lambda_phi=args.lambda_phi,
-        lambda_phi_mstep=args.lambda_phi_mstep,
+        lambda_phi_estep=args.lambda_phi_estep,
         lambda_R=args.lambda_r,
         meter_candidates=args.meter_candidates,
         quantize_targets=args.quantize_targets,
@@ -141,6 +140,7 @@ def main(args):
                  "transformer": args.transformer_dropout},
         fragment_frames=args.train_length,
         b_0=args.b_0,
+        b_phi_0=args.b_phi_0,
         time_reparam=args.time_reparam,
         warmup_epochs=int(args.scale_warmup_fraction * args.max_epochs),
 
@@ -176,6 +176,7 @@ def main(args):
         callbacks=callbacks,
         log_every_n_steps=1,
         precision="16-mixed",
+        gradient_clip_val=args.gradient_clip_val or None,
         accumulate_grad_batches=args.accumulate_grad_batches,
         check_val_every_n_epoch=args.val_frequency,
         limit_train_batches=args.limit_train_batches or 1.0,
@@ -247,14 +248,17 @@ def build_parser():
                         help="cap validation batches per epoch (0 = no cap). Smoke tests only.")
 
     # this formulation's own knobs (no launch_scripts/train.py counterpart)
-    parser.add_argument("--lambda_phi", type=float, default=config.LAMBDA_PHI,
-                        help="eq. (19): weight on the circular phase term. No "
-                             "AlignBeat counterpart -- omega_db weighted a discrete "
-                             "class, not a distance. Wants its own sweep.")
-    parser.add_argument("--lambda-phi-mstep", type=float, default=config.LAMBDA_PHI_MSTEP,
-                        help="M-step weight on the phase and agreement terms, i.e. the "
-                             "phase gradient's size against the timing gradient's; "
-                             "--lambda_phi stays the E-step matching weight (config.py)")
+    parser.add_argument("--b-phi-0", type=float, default=config.B_PHI_0,
+                        help="warm-start value of the learned phase scale b_phi; the phase "
+                             "weight is 1 / b_phi (appendix: ~0.03 -> lambda_phi ~ 33)")
+    parser.add_argument("--lambda-phi-estep", type=float, default=config.LAMBDA_PHI_ESTEP,
+                        help="pin the E-step (matching) phase weight to this value instead "
+                             "of the fragment's 1 / b_phi; default None = 1 / b_phi")
+    parser.add_argument("--gradient-clip-val", type=float, default=0.0,
+                        help="clip gradient norm (0 = off, the upstream default). The phase "
+                             "weight 1/b_phi can reach 1/B_PHI_MIN; two 2026-09-06 runs "
+                             "produced NaN outputs under 16-bit precision, so this is the "
+                             "lever to try if 'nonfinite' appears in the progress bar")
     parser.add_argument("--time-reparam", choices=["local", "monotone"], default=config.TIME_REPARAM,
                         help="candidate time parameterisation: 'local' per-slot offset "
                              "(trains), 'monotone' the document's cumsum (config.py)")

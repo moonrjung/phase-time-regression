@@ -1,4 +1,4 @@
-"""Grid sweep over lambda_phi_mstep (the M-step phase weight) and lambda_R.
+"""Grid sweep over b_phi_0 (the phase scale warm-start, phase weight 1/b_phi) and lambda_R.
 
 Why this exists: neither weight has a derivation. lambda_phi = 3 is the
 document's worked-example value (config.py) and lambda_R is a calibration
@@ -9,13 +9,13 @@ baselines are scored.
 
 Two phases, one script:
 
-  python sweep.py launch  --lambda-phi-mstep 30 100 300 --lambda-r 0 4000 \
+  python sweep.py launch  --b-phi-0 0.01 0.03 0.1 --lambda-r 0 4000 \
                           --gpus 0 1 2 3 --per-gpu 2 --fold 0 --max-epochs 40
-  python sweep.py collect --lambda-phi-mstep 30 100 300 --lambda-r 0 4000 --fold 0 --gpu 0
+  python sweep.py collect --b-phi-0 0.01 0.03 0.1 --lambda-r 0 4000 --fold 0 --gpu 0
 
 `launch` runs train.py once per (lambda_phi, lambda_R) pair, spread over the
 given GPUs with at most --per-gpu runs sharing a GPU, and waits for all of
-them. Each run is named sweep_lpm{phi}_lr{R} so its checkpoint and log are
+them. Each run is named sweep_bphi{phi}_lr{R} so its checkpoint and log are
 identifiable; a run whose final checkpoint already exists is skipped unless
 --force. `collect` scores each run's final checkpoint with evaluate.py on
 the fold's middle excerpts (the baselines' protocol) and prints one table
@@ -39,7 +39,7 @@ PY = sys.executable                     # the interpreter running this script
 
 
 def run_name(lp: float, lr: float) -> str:
-    return f"sweep_lpm{lp:g}_lr{lr:g}"
+    return f"sweep_bphi{lp:g}_lr{lr:g}"
 
 
 def checkpoint_glob(name: str, seed: int, fold: int) -> str:
@@ -52,7 +52,7 @@ def train_command(lp, lr, gpu, args, passthrough):
             "--name", run_name(lp, lr), "--gpu", str(gpu),
             "--fold", str(args.fold), "--seed", str(args.seed),
             "--max-epochs", str(args.max_epochs),
-            "--lambda-phi-mstep", str(lp), "--lambda_r", str(lr),
+            "--b-phi-0", str(lp), "--lambda_r", str(lr),
             # one final checkpoint per run, no per-epoch snapshots: the sweep
             # compares end points, and 16 runs x 8 snapshots is 12 GB
             "--snapshot_every", "0", "--val-frequency", str(args.max_epochs),
@@ -60,7 +60,7 @@ def train_command(lp, lr, gpu, args, passthrough):
 
 
 def launch(args, passthrough):
-    grid = [(lp, lr) for lp in args.lambda_phi_mstep for lr in args.lambda_r]
+    grid = [(lp, lr) for lp in args.b_phi_0 for lr in args.lambda_r]
     log_dir = REPO / "sweep_logs"
     log_dir.mkdir(exist_ok=True)
 
@@ -107,7 +107,7 @@ def launch(args, passthrough):
 
 def collect(args, passthrough):
     results = []
-    for lp in args.lambda_phi_mstep:
+    for lp in args.b_phi_0:
         for lr in args.lambda_r:
             name = run_name(lp, lr)
             pattern = checkpoint_glob(name, args.seed, args.fold)
@@ -132,14 +132,14 @@ def collect(args, passthrough):
             # evaluate.py scores every checkpoint matching the glob; with
             # snapshot_every 0 there is exactly one. Keep the last row anyway.
             r = rows[-1]
-            results.append({"lambda_phi_mstep": lp, "lambda_R": lr, "n": int(r["n"]),
+            results.append({"b_phi_0": lp, "lambda_R": lr, "n": int(r["n"]),
                             **{k: float(r[k]) for k in ("F", "CMLt", "AMLt", "dbF")}})
     if args.dry_run or not results:
         return
     results.sort(key=lambda r: -r["F"])
-    print(f"\n{'lphi_mstep':>10} {'lambda_R':>10} {'n':>5} {'F':>8} {'CMLt':>8} {'AMLt':>8} {'dbF':>8}")
+    print(f"\n{'b_phi_0':>10} {'lambda_R':>10} {'n':>5} {'F':>8} {'CMLt':>8} {'AMLt':>8} {'dbF':>8}")
     for r in results:
-        print(f"{r['lambda_phi_mstep']:>10g} {r['lambda_R']:>10g} {r['n']:>5} "
+        print(f"{r['b_phi_0']:>10g} {r['lambda_R']:>10g} {r['n']:>5} "
               f"{r['F']:>8.4f} {r['CMLt']:>8.4f} {r['AMLt']:>8.4f} {r['dbF']:>8.4f}")
     out = REPO / "sweep_results.csv"
     with open(out, "w", newline="") as handle:
@@ -155,8 +155,8 @@ def build_parser():
     # Grid. Defaults: lambda_phi spans the document's 3 up to the ~100x the
     # gradient ratio suggests; lambda_R spans off, a tenth of, and ten times
     # config.py's calibration.
-    p.add_argument("--lambda-phi-mstep", type=float, nargs="+", default=[30.0, 100.0, 300.0],
-                   help="M-step phase weights to try; the E-step weight stays config.LAMBDA_PHI")
+    p.add_argument("--b-phi-0", type=float, nargs="+", default=[0.01, 0.03, 0.1],
+                   help="warm-start phase scales to try (phase weight = 1 / b_phi)")
     p.add_argument("--lambda-r", type=float, nargs="+",
                    default=[0.0, config.LAMBDA_R / 10, config.LAMBDA_R, config.LAMBDA_R * 10])
     p.add_argument("--fold", type=int, default=0)

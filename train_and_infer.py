@@ -117,6 +117,34 @@ def time_term(residual: torch.Tensor, b: torch.Tensor,
     return localisation + precision
 
 
+def wrapped_laplace_log_norm(b_phi: torch.Tensor) -> torch.Tensor:
+    """log Z(b_phi) for the Laplace density exp(-d / b_phi) / Z wrapped on the
+    unit circle, d in [0, 1/2]: Z = int_{-1/2}^{1/2} exp(-|x| / b) dx
+    = 2 b (1 - exp(-1 / (2 b))). Tends to 2b for small b (the line's Laplace
+    normaliser) and to 1 for large b (uniform on the circle), so it is
+    bounded: log Z in [log 2 b_min, 0]. This is eq. (scalerestore) for phase."""
+    return torch.log(2.0 * b_phi * (1.0 - torch.exp(-1.0 / (2.0 * b_phi))))
+
+
+def phase_term(dist: torch.Tensor, b_phi: torch.Tensor) -> torch.Tensor:
+    """-log p(d | b_phi) for the wrapped Laplace, per event, with the same
+    gradient split as time_term: the localisation channel moves hat_phi with
+    slope 1 / b_phi (the appendix's lambda_phi := 1 / b_phi), the precision
+    channel moves b_phi toward the MLE, where b_phi equals the typical phase
+    residual. dist is a circular distance in [0, 1/2]."""
+    localisation = dist / b_phi.detach()
+    precision = dist.detach() / b_phi + wrapped_laplace_log_norm(b_phi)
+    return localisation + precision
+
+
+def phase_weight(b_phi: torch.Tensor, lambda_phi_estep: float | None = config.LAMBDA_PHI_ESTEP) -> float:
+    """The E-step's phase weight for one fragment: 1 / b_phi (the appendix's
+    single scale) unless config.LAMBDA_PHI_ESTEP pins it."""
+    if lambda_phi_estep is not None:
+        return float(lambda_phi_estep)
+    return float(1.0 / b_phi.detach())
+
+
 def l_agree(hat_phi: torch.Tensor, t_true: torch.Tensor, phi_true: torch.Tensor,
             hat_t: torch.Tensor) -> torch.Tensor:
     """eq. (agree): for every candidate j, its agreement cost against the
@@ -160,6 +188,13 @@ def subset_select_dp(cost: torch.Tensor, agree: torch.Tensor | None = None):
     Returns hat_sigma as a length-M LongTensor of 1-indexed candidate
     positions (hat_sigma[i] = j means event i matched to candidate j)."""
     M, N = cost.shape
+    # A NaN anywhere makes every comparison false, the DP never records a
+    # match, and the backtrack walks j below 0 (seen as an IndexError deep in
+    # the kernel on 2026-09-06 after a batch produced non-finite outputs under
+    # 16-bit mixed precision). Fail here, with the cause named.
+    if not torch.isfinite(cost).all() or (agree is not None and not torch.isfinite(agree).all()):
+        raise ValueError("non-finite matching cost: the model emitted NaN/Inf (hat_t, hat_phi "
+                         "or b_e); callers should skip such fragments (pl_module does)")
 
     if _HAVE_NUMBA:
         cost_np = np.ascontiguousarray(cost.detach().cpu().numpy(), dtype=np.float64)
@@ -335,7 +370,8 @@ def e_step(t_true: torch.Tensor, hat_t: torch.Tensor, hat_phi: torch.Tensor,
 
 def periodicity_R(matched_t: torch.Tensor, downbeat_idx: torch.Tensor,
                   bar_lengths: torch.Tensor) -> torch.Tensor:
-    """eq. (48): R = sum_k ( t_sigma(i_{k+1}) - t_sigma(i_k) - L_k * Delta_bar )^2.
+    """eq. (48), normalised (appendix eq. periodicitynormalized):
+    R = sum_k ( (t_sigma(i_{k+1}) - t_sigma(i_k) - L_k Delta_bar) / (L_k Delta_bar) )^2.
 
     matched_t:    (M,) predicted times of the matched events, in time order.
     downbeat_idx: (K,) event indices i_1 < ... < i_K of the downbeats.
@@ -353,7 +389,11 @@ def periodicity_R(matched_t: torch.Tensor, downbeat_idx: torch.Tensor,
     M = matched_t.shape[0]
     delta_bar = (matched_t[-1] - matched_t[0]) / max(M - 1, 1)
     expected = bar_lengths.to(spacings) * delta_bar
-    return ((spacings - expected) ** 2).sum()
+    # Appendix eq. (periodicitynormalized): relative to the expected bar
+    # duration, so R is a dimensionless fraction of a bar and one sigma_R
+    # (config.SIGMA_R) serves every tempo. Gradient flows through both the
+    # spacing and the expected duration, as the appendix writes it.
+    return (((spacings - expected) / expected.clamp_min(1e-6)) ** 2).sum()
 
 
 def marginal_periodicity(matched_t: torch.Tensor, meter_hyps: list,
@@ -402,12 +442,11 @@ def marginal_periodicity(matched_t: torch.Tensor, meter_hyps: list,
 
 def m_step_loss(hat_sigma: torch.Tensor, phi_i: torch.Tensor,
                  t_true: torch.Tensor, hat_t: torch.Tensor, hat_phi: torch.Tensor,
-                 b_e: torch.Tensor, lambda_phi: float,
+                 b_e: torch.Tensor, b_phi: torch.Tensor,
                  unmatched_agree=None, lambda_R: float = 0.0,
                  downbeat_idx: torch.Tensor | None = None,
                  bar_lengths: torch.Tensor | None = None,
-                 meter_hyps: list | None = None,
-                 lambda_phi_mstep: float | None = None) -> torch.Tensor:
+                 meter_hyps: list | None = None) -> torch.Tensor:
     """Algorithm 5: MStep. Assembles eq. (totalloss)'s per-fragment summand:
     matched timing+phase terms (eps-insensitive, with AlignBeat's bounded
     log(2 eps + 2 b_e) normaliser; AlignBeat's Gamma precision prior is
@@ -433,12 +472,12 @@ def m_step_loss(hat_sigma: torch.Tensor, phi_i: torch.Tensor,
     # per event. The M log(2 b_e) of eq. (totalloss) is the eps=0 case.
     residual = (t_true - matched_t).abs().sub(config.EPS_RESIDUAL).clamp(min=0.0)
     timing_term = time_term(residual, b_e).sum()
-    # The phase weight here is the M-step (gradient-balance) weight, which is
-    # deliberately not the E-step's matching weight; see config.LAMBDA_PHI_MSTEP.
-    lambda_phi_m = config.LAMBDA_PHI_MSTEP if lambda_phi_mstep is None else lambda_phi_mstep
-    phase_term = lambda_phi_m * circ_dist(phi_i, matched_phi).sum()
+    # Wrapped-Laplace phase likelihood with the learned per-fragment scale
+    # b_phi (appendix: lambda_phi := 1 / b_phi), same structure as the timing
+    # term including its log-scale restoration; see phase_term.
+    phase_nll = phase_term(circ_dist(phi_i, matched_phi), b_phi).sum()
 
-    loss = timing_term + phase_term
+    loss = timing_term + phase_nll
 
     if unmatched_agree is not None:
         _, agree_vals = unmatched_agree
@@ -447,11 +486,12 @@ def m_step_loss(hat_sigma: torch.Tensor, phi_i: torch.Tensor,
             # training signal the unmatched candidates' phases get, and decode
             # relies on those phases sitting OFF the grid (interpolated between
             # the bracketing beats) to reject them. Weighted 1 against a phase
-            # term weighted lambda_phi_m, they were not trained at all: on a
-            # fitted batch every unmatched candidate simply copied the
-            # neighbouring beat's phase and decode emitted 2 candidates per
-            # beat. Same weight as the matched phase term, for the same reason.
-            loss = loss + lambda_phi_m * agree_vals.sum()
+            # term at 1 / b_phi they were not trained at all: on a fitted batch
+            # every unmatched candidate copied the neighbouring beat's phase and
+            # decode emitted 2 candidates per beat. There is one phase
+            # likelihood, so the unmatched residuals go through the same
+            # wrapped-Laplace term, and b_phi is the MLE over all of them.
+            loss = loss + phase_term(agree_vals, b_phi).sum()
 
     if lambda_R > 0:
         if downbeat_idx is not None and bar_lengths is not None and downbeat_idx.numel() >= 2:
@@ -469,8 +509,7 @@ def m_step_loss(hat_sigma: torch.Tensor, phi_i: torch.Tensor,
 def train_step(model, x: torch.Tensor, t_true: torch.Tensor, ind: int,
                 phi_true: torch.Tensor | None,
                 downbeat_idx: torch.Tensor | None, bar_lengths: torch.Tensor | None,
-                epoch: int, lambda_phi: float = config.LAMBDA_PHI,
-                lambda_R: float = config.LAMBDA_R,
+                epoch: int, lambda_R: float = config.LAMBDA_R,
                 meter_candidates: list[int] = config.METER_CANDIDATES,
                 pi_M: list[float] = config.PI_M):
     """Algorithm 3: one fragment's training step. Runs the model forward,
@@ -478,13 +517,13 @@ def train_step(model, x: torch.Tensor, t_true: torch.Tensor, ind: int,
     -- ready for loss.backward() and an optimizer step by the caller.
     downbeat_idx / bar_lengths are the annotation's downbeats (ind=0 only);
     for ind=1 the meter is latent and comes from meter_candidates / pi_M."""
-    hat_phi, hat_t, b_e = model(x, epoch=epoch)
-    hat_phi, hat_t, b_e = hat_phi[0], hat_t[0], b_e[0]  # drop the batch dim (batch=1 only)
+    hat_phi, hat_t, b_e, b_phi = model(x, epoch=epoch)
+    hat_phi, hat_t, b_e, b_phi = hat_phi[0], hat_t[0], b_e[0], b_phi[0]  # batch=1 only
 
     hat_sigma, phi_i, unmatched, hyps = e_step(
-        t_true, hat_t, hat_phi, b_e, lambda_phi, ind, phi_true=phi_true,
+        t_true, hat_t, hat_phi, b_e, phase_weight(b_phi), ind, phi_true=phi_true,
         meter_candidates=meter_candidates, pi_M=pi_M)
-    loss = m_step_loss(hat_sigma, phi_i, t_true, hat_t, hat_phi, b_e, lambda_phi,
+    loss = m_step_loss(hat_sigma, phi_i, t_true, hat_t, hat_phi, b_e, b_phi,
                         unmatched_agree=unmatched, lambda_R=lambda_R,
                         downbeat_idx=downbeat_idx, bar_lengths=bar_lengths,
                         meter_hyps=hyps)
@@ -492,8 +531,7 @@ def train_step(model, x: torch.Tensor, t_true: torch.Tensor, ind: int,
 
 
 def training_loop(model, dataset, n_epochs: int = config.MAX_EPOCHS,
-                   lr: float = config.LR, lambda_phi: float = config.LAMBDA_PHI,
-                   lambda_R: float = config.LAMBDA_R,
+                   lr: float = config.LR, lambda_R: float = config.LAMBDA_R,
                    weight_decay: float = config.WEIGHT_DECAY,
                    warmup_steps: int = config.WARMUP_STEPS):
     """Algorithm 6: minibatch training loop, batch size 1 (see module
@@ -516,7 +554,7 @@ def training_loop(model, dataset, n_epochs: int = config.MAX_EPOCHS,
         for x, t_true, ind, phi_true, downbeat_idx, bar_lengths in dataset:
             optimizer.zero_grad()
             loss = train_step(model, x, t_true, ind, phi_true, downbeat_idx, bar_lengths,
-                              epoch, lambda_phi, lambda_R)
+                              epoch, lambda_R)
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -644,7 +682,7 @@ def meter_consistency_correction(B: list, hat_L: int, p_hat: list, d: list, t_ha
 def inference(model, x: torch.Tensor,
               candidate_meters: list[int] = None, pi_M: torch.Tensor = None,
               tau: float = config.TAU, tau_prime: float = config.TAU_PRIME,
-              lambda_phi: float = config.LAMBDA_PHI):
+              lambda_phi: float | None = None):
     """Algorithm 9 + 10, full inference pipeline."""
     if candidate_meters is None:
         candidate_meters = config.METER_CANDIDATES
@@ -652,9 +690,11 @@ def inference(model, x: torch.Tensor,
         pi_M = torch.tensor(config.PI_M)
     model.eval()
     with torch.no_grad():
-        hat_phi, hat_t, _ = model(x)  # epoch=None -> always the trained ScaleHead
+        hat_phi, hat_t, _, b_phi = model(x)  # epoch=None -> the trained ScaleHeads
         hat_phi, hat_t = hat_phi[0], hat_t[0]
-        hat_L = infer_meter(hat_phi, candidate_meters, pi_M, lambda_phi)
+        # lambda_phi None -> the fragment's own 1 / b_phi, as in training
+        hat_L = infer_meter(hat_phi, candidate_meters, pi_M,
+                            phase_weight(b_phi[0], lambda_phi))
         p_hat, d, t_hat, B = decode(hat_phi, hat_t, hat_L, tau)
         B = meter_consistency_correction(B, hat_L, p_hat, d, t_hat, tau, tau_prime)
     return B, hat_L
@@ -670,7 +710,8 @@ if __name__ == "__main__":
     hat_phi = torch.rand(N)
     b_e = torch.tensor(0.05)
 
-    cost = match_cost_matrix(t_true, phi_true, hat_t, hat_phi, b_e, lambda_phi=config.LAMBDA_PHI, phase_blind=False)
+    lam = 1.0 / config.B_PHI_0
+    cost = match_cost_matrix(t_true, phi_true, hat_t, hat_phi, b_e, lambda_phi=lam, phase_blind=False)
     agree = l_agree(hat_phi, t_true, phi_true, hat_t)
 
     hat_sigma = subset_select_dp(cost, agree)
@@ -705,7 +746,7 @@ if __name__ == "__main__":
         ht = torch.sort(torch.rand(n_))[0]
         pt, hp = torch.rand(m_), torch.rand(n_)
         c = match_cost_matrix(tt, pt, ht, hp, torch.tensor(0.05),
-                              lambda_phi=config.LAMBDA_PHI, phase_blind=False)
+                              lambda_phi=lam, phase_blind=False)
         a = l_agree(hp, tt, pt, ht)
         if tuple(subset_select_dp(c, a).tolist()) != brute_force(c, a, m_, n_):
             disagreements += 1
@@ -722,32 +763,42 @@ if __name__ == "__main__":
     hat_t2 = hat_t.clone().requires_grad_(True)
     hat_phi2 = hat_phi.clone().requires_grad_(True)
     b_e2 = torch.tensor(0.05, requires_grad=True)
-    hs, phi_i, unmatched, hyps0 = e_step(t_true, hat_t2, hat_phi2, b_e2, lambda_phi=config.LAMBDA_PHI, ind=0, phi_true=phi_true)
+    b_phi2 = torch.tensor(config.B_PHI_0, requires_grad=True)
+    hs, phi_i, unmatched, hyps0 = e_step(t_true, hat_t2, hat_phi2, b_e2, lambda_phi=lam, ind=0, phi_true=phi_true)
     print("hat_sigma:", hs.tolist(), " requires_grad:", hs.requires_grad if hasattr(hs, 'requires_grad') else False)
     print("meter hypotheses for ind=0 (should be None):", hyps0)
-    loss = m_step_loss(hs, phi_i, t_true, hat_t2, hat_phi2, b_e2, lambda_phi=config.LAMBDA_PHI, unmatched_agree=unmatched)
+    loss = m_step_loss(hs, phi_i, t_true, hat_t2, hat_phi2, b_e2, b_phi2, unmatched_agree=unmatched)
     print("loss:", loss.item())
     loss.backward()
     print("grad flows to hat_t:", hat_t2.grad is not None and hat_t2.grad.abs().sum() > 0)
     print("grad flows to hat_phi:", hat_phi2.grad is not None and hat_phi2.grad.abs().sum() > 0)
     print("grad flows to b_e:", b_e2.grad is not None and b_e2.grad.abs().sum() > 0)
+    print("grad flows to b_phi:", b_phi2.grad is not None and b_phi2.grad.abs().sum() > 0)
 
     print("\n=== E-step / M-step, ind=1 (beat-only, latent meter) ===")
     hat_t3 = torch.sort(torch.rand(N))[0].requires_grad_(True)
     hat_phi3 = torch.rand(N, requires_grad=True)
     b_e3 = torch.tensor(0.05, requires_grad=True)
-    hs2, phi_i2, unmatched2, hyps = e_step(t_true, hat_t3, hat_phi3, b_e3, lambda_phi=config.LAMBDA_PHI, ind=1,
+    b_phi3 = torch.tensor(config.B_PHI_0, requires_grad=True)
+    hs2, phi_i2, unmatched2, hyps = e_step(t_true, hat_t3, hat_phi3, b_e3, lambda_phi=lam, ind=1,
                                            meter_candidates=config.METER_CANDIDATES, pi_M=config.PI_M)
     print("hat_sigma:", hs2.tolist(), "phi_i (resolved, detached):", phi_i2.tolist())
     print("phi_i requires_grad (should be False):", phi_i2.requires_grad)
     print("meter hypotheses (L, score):", [(h.L, round(h.score, 3)) for h in hyps],
           "-> hat_L =", min(hyps, key=lambda h: h.score).L)
-    loss2 = m_step_loss(hs2, phi_i2, t_true, hat_t3, hat_phi3, b_e3, lambda_phi=config.LAMBDA_PHI,
+    loss2 = m_step_loss(hs2, phi_i2, t_true, hat_t3, hat_phi3, b_e3, b_phi3,
                          unmatched_agree=unmatched2, lambda_R=config.LAMBDA_R, meter_hyps=hyps)
     print("loss:", loss2.item())
     loss2.backward()
     print("grad flows to hat_t:", hat_t3.grad is not None and hat_t3.grad.abs().sum() > 0)
     print("grad flows to hat_phi:", hat_phi3.grad is not None and hat_phi3.grad.abs().sum() > 0)
+
+    print("\n=== Wrapped-Laplace phase term: finite minimum in b_phi ===")
+    dist = torch.full((48,), 0.03)
+    for b in [0.003, 0.01, 0.03, 0.1, 0.3, 1.0]:
+        bt = torch.tensor(b, requires_grad=True); Lp = phase_term(dist, bt).sum(); Lp.backward()
+        print(f"  b_phi={b:5.3f}  loss={Lp.item():8.2f}  dL/db={bt.grad.item():+9.1f}")
+    print("  (residuals all 0.03: minimum must sit at b_phi ~ 0.03, gradient changes sign there)")
 
     print("\n=== Periodicity regulariser, eq. (48), on a synthetic 4/4 fragment ===")
     # 12 beats at a constant period; downbeats every 4 -> R must be 0 with the

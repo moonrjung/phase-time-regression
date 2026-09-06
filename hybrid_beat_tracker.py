@@ -62,6 +62,7 @@ class HybridBeatTracker(nn.Module):
                  reg_hidden: int = config.HEAD_HIDDEN,
                  scale_hidden: int = config.HEAD_HIDDEN,
                  b_0: float = config.B_0,
+                 b_phi_0: float = config.B_PHI_0,
                  warmup_epochs: int = config.WARMUP_EPOCHS,
                  ff_mult: int = config.FF_MULT,
                  dropout: dict = None,
@@ -101,8 +102,13 @@ class HybridBeatTracker(nn.Module):
             final_norm=config.ATTENTION_FINAL_NORM)
         self.phase_head = PhaseHead(reduced_dim, phase_hidden)
         self.reg_head = RegHead(reduced_dim, reg_hidden)
-        self.scale_head = ScaleHead(reduced_dim, scale_hidden, b_min=config.B_MIN)
+        self.scale_head = ScaleHead(reduced_dim, scale_hidden, b_min=config.B_MIN, b_init=b_0)
+        # Same construction for the phase scale b_phi (appendix: the learned
+        # scale + log-scale restoration applied symmetrically to every term).
+        self.phase_scale_head = ScaleHead(reduced_dim, scale_hidden,
+                                          b_min=config.B_PHI_MIN, b_init=b_phi_0)
         self.b_0 = b_0
+        self.b_phi_0 = b_phi_0
         self.warmup_epochs = warmup_epochs
 
     def forward(self, x: torch.Tensor, epoch: int | None = None):
@@ -120,10 +126,12 @@ class HybridBeatTracker(nn.Module):
         z_bar = mean_pool_candidates(z)               # (batch, reduced_dim)
         if epoch is None:
             b_e = self.scale_head(z_bar)
+            b_phi = self.phase_scale_head(z_bar)
         else:
             b_e = scale_with_warmup(z_bar, self.scale_head, epoch, self.warmup_epochs, self.b_0)
+            b_phi = scale_with_warmup(z_bar, self.phase_scale_head, epoch, self.warmup_epochs, self.b_phi_0)
 
-        return hat_phi, hat_t, b_e
+        return hat_phi, hat_t, b_e, b_phi
 
 
 if __name__ == "__main__":
@@ -137,11 +145,11 @@ if __name__ == "__main__":
 
     model = HybridBeatTracker()
 
-    hat_phi, hat_t, b_e = model(x, epoch=1)
+    hat_phi, hat_t, b_e, b_phi = model(x, epoch=1)
     print("warm-start (epoch=1): b_e == b_0?",
           torch.allclose(b_e, torch.full_like(b_e, model.b_0)))
 
-    hat_phi, hat_t, b_e = model(x, epoch=10)
+    hat_phi, hat_t, b_e, b_phi = model(x, epoch=10)
     print(f"T={T}, N_min={N_min} -> stages={config.DOWNSAMPLE_STAGES}, "
           f"N={config.NUM_CANDIDATES}, padded={model.downsample.padded_length}")
     print("hat_phi shape:", hat_phi.shape, " hat_t shape:", hat_t.shape)

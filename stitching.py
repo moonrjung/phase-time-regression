@@ -15,7 +15,9 @@ instead.
 import numpy as np
 import torch
 
-from train_and_infer import (circ_dist, decode, infer_meter,
+import config
+
+from train_and_infer import (circ_dist, decode, infer_meter, phase_weight,
                              meter_consistency_correction)
 
 
@@ -93,10 +95,16 @@ def stitch_piece(mel, model, fragment_frames, border_frames, fps,
         if device is not None:
             chunk = chunk.to(device)
         with torch.no_grad():
-            hat_phi, hat_t, _ = model(chunk.float())
-        hat_phi, hat_t = hat_phi[0].float(), hat_t[0].float()
-
-        hat_L = infer_meter(hat_phi, candidate_meters, pi_M, lambda_phi)
+            out = model(chunk.float())
+        hat_phi, hat_t = out[0][0].float(), out[1][0].float()
+        # lambda_phi None -> the fragment's own 1 / b_phi (4th output), as in
+        # training; a float pins it (config.LAMBDA_PHI_ESTEP). oracle_check's
+        # oracle returns no b_phi and passes a number.
+        if lambda_phi is None:
+            lam = phase_weight(out[3][0].float()) if len(out) > 3 else 1.0 / config.B_PHI_0
+        else:
+            lam = float(lambda_phi)
+        hat_L = infer_meter(hat_phi, candidate_meters, pi_M, lam)
         p_hat, d, t_hat, B = decode(hat_phi, hat_t, hat_L, tau)
         B = meter_consistency_correction(B, hat_L, p_hat, d, t_hat, tau, tau_prime)
 

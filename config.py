@@ -119,24 +119,31 @@ TAU_PRIME = 1.5 * TAU        # 0.3
 # ---------------------------------------------------------------------------
 # Loss weights.
 # ---------------------------------------------------------------------------
-# NO ALIGNBEAT COUNTERPART. lambda_phi weights a CIRCULAR DISTANCE against the
-# timing term; AlignBeat's nearest analogue, --omega_db 4.0, weights a discrete
-# downbeat CLASS against beat/background, which is a different quantity on a
-# different scale. Left at the paper's own worked-example value (Sections
-# 3.3-3.4 use lambda_phi = 3.0) and flagged as needing its own sweep.
-LAMBDA_PHI = 3.0
+# Phase scale b_phi (appendix "Calibrating the loss weights"). lambda_phi is
+# NOT a free weight: it is 1/b_phi, the inverse scale of a wrapped-Laplace
+# likelihood on the phase residual d_circ in [0, 0.5], exactly as lambda_L1 =
+# 1/b is for timing. The appendix calibrates both against ONE BAR as the
+# common unit: a typical well-trained timing error of 50 ms is 0.025 of a 2 s
+# bar, a typical phase error is ~0.03 of a bar, so b ~ 0.025, b_phi ~ 0.03 and
+# lambda_phi ~ 33 -- not the 3 of the document's worked examples. Phases
+# already live in bar fractions, so b_phi carries over unchanged; B_0 below
+# stays in window fractions (70 ms / 30 s), which is 0.035 of a 2 s bar.
+#
+# Like b_e, b_phi is LEARNED per fragment by a second ScaleHead with its own
+# log-scale restoration term (train_and_infer.phase_term), warm-started at
+# B_PHI_0 and held for the same warm-up as b_e. The appendix's early/late
+# argument is why: untrained phase errors are ~0.25 and a fixed b_phi of 0.03
+# would charge 8 nats and huge gradients per event.
+B_PHI_0 = 0.03
+B_PHI_MIN = 1e-3
 
-# lambda_phi does TWO jobs that want different values. In the E-step it
-# trades phase against timing when deciding WHICH candidate matches an event
-# (eqs. matchcost); there 3 is fine and 30 broke the matching (candidates
-# chosen by phase agreement, not by time, so the timing head never got a
-# clean signal). In the M-step it sets the phase gradient's magnitude against
-# the timing gradient's, and the timing gradient is residual / b_e per event,
-# i.e. 1/b_e ~ 400 at b_0 and larger once b_e shrinks; measured 80-150x the
-# phase gradient. The shared trunk follows the larger one, so the phase head
-# sees only noise unless the M-step weight is of that order. This is the
-# M-step (loss) weight; LAMBDA_PHI above stays the E-step (matching) weight.
-LAMBDA_PHI_MSTEP = 100.0
+# The appendix uses the single scale 1/b_phi in the E-step (matching) as well
+# as in the loss. None here does exactly that. A float pins the E-step weight
+# to that value instead, the escape hatch kept because a matching weight of
+# 30 broke the E-step in the sweep of 2026-09-06 (candidates chosen by phase
+# agreement, not by time) -- measured before the local time reparam and the
+# other fixes, so it may no longer apply; the one-batch overfit test decides.
+LAMBDA_PHI_ESTEP = None
 
 
 # ---------------------------------------------------------------------------
@@ -167,30 +174,27 @@ TIME_REPARAM = "local"
 B_0 = F_MEASURE_TOLERANCE / WINDOW_SECONDS   # 0.07 s / 30 s = 0.002333
 B_MIN = 1e-4                                  # alignbeat/criterion.py:24, same units (window fraction)
 
-# Periodicity regulariser weight, eq. (48) / eq. (53)'s third line.
+# Periodicity regulariser, eq. (48) in the appendix's normalised form
+# (eq. periodicitynormalized): the deviation of each downbeat spacing from
+# L * Delta_bar is divided by L * Delta_bar BEFORE squaring, so R is a
+# dimensionless fraction of a bar and one sigma_R serves every tempo (a fixed
+# absolute scale calibrated at 180 BPM would penalise the same relative
+# deviation 9x more at 60 BPM). Then lambda_R := 1 / (2 sigma_R^2), eq.
+# (lambdaR), i.e. R is a Gaussian likelihood on relative bar-length error.
 #
-# The document makes this a PER-FRAGMENT switch, not a global one: lambda_R is
-# nonzero wherever the track's meter L is annotated, and "set to 0 for that
-# fragment" only where it is not. The code follows that (m_step_loss): fully-
-# labeled fragments use eq. (48) with the annotated bar lengths; beat-only
-# fragments, where the document would zero it, marginalise R over the
-# candidate meters instead (marginal_periodicity), a milder step than the
-# forbidden "incorrect default meter". So this constant is the weight in force
-# wherever R is computable at all. 0.0 disables the term everywhere, which is
-# what AlignBeat runs (its documented --lambda_r flag was never wired up).
-#
-# Scale. R is a squared time in window fractions, so its natural magnitude is
-# tiny: at 120 BPM one beat period is 0.5 s / 30 s = 0.0167, and a downbeat
-# displaced by a whole beat contributes (0.0167)^2 = 2.8e-4 to R. The timing
-# term charges that same one-beat error about (0.0167 - eps) / b_0 = 6 units.
-# Calibrate lambda_R so the two agree at a one-beat error:
-#     lambda_R * DELTA_TYP^2 = DELTA_TYP / B_0   =>   lambda_R = 1 / (B_0 * DELTA_TYP)
-# = 1 / (0.002333 * 0.016667) = 2.6e4. Below one beat the quadratic R is milder
-# than the linear timing term, above it harsher, which is the intended shape.
-# The document gives no value; this is a calibration, not a derivation, and
-# wants its own sweep like lambda_phi. Override with --lambda_r.
-DELTA_TYP = 0.5 / WINDOW_SECONDS              # one beat at 120 BPM, window fraction
-LAMBDA_R = 1.0 / (B_0 * DELTA_TYP)
+# sigma_R is the empirical std of relative downbeat-spacing deviations over
+# the fully-labeled training pieces (scratch script sigma_r.py), with
+# Delta_bar taken over a 30 s window around each bar as the loss sees it.
+# The distribution is heavy-tailed (pieces with tempo or meter changes), so
+# the plain std is set by the tails; the value below is stated with both
+# figures so the choice is visible. lambda_R is gated per fragment as before:
+# annotated L -> eq. (48); latent L -> marginal over the candidate meters.
+# Measured 2026-09-06 over 3744 pieces / 306584 bars: std 0.131, robust
+# (1.4826 MAD) 0.007, median |dev| 0.005, 90th percentile 0.097. The std is
+# the appendix's definition and is used; the robust figure would give
+# lambda_R ~ 10^4, which the 2026-09-06 sweep showed destroys the phase head.
+SIGMA_R = 0.131
+LAMBDA_R = 1.0 / (2.0 * SIGMA_R ** 2)
 
 # The tolerance in the units hat_t lives in (== B_0). Used in two places
 # that AlignBeat ties together but this model must NOT:

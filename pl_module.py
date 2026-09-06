@@ -28,7 +28,7 @@ from pytorch_lightning import LightningModule
 
 import config
 from hybrid_beat_tracker import HybridBeatTracker
-from train_and_infer import e_step, m_step_loss
+from train_and_infer import e_step, m_step_loss, phase_weight
 
 
 # The most common meter in the corpus (METER_PRIOR puts 0.86 on it). Used only
@@ -140,8 +140,7 @@ class PLPhaseTimeRegression(LightningModule):
                  warmup_steps: int = config.WARMUP_STEPS,
                  max_epochs: int = config.MAX_EPOCHS,
                  fps: int = config.FPS,
-                 lambda_phi: float = config.LAMBDA_PHI,
-                 lambda_phi_mstep: float = config.LAMBDA_PHI_MSTEP,
+                 lambda_phi_estep: float | None = config.LAMBDA_PHI_ESTEP,
                  lambda_R: float = config.LAMBDA_R,
                  meter_candidates: list[int] = tuple(config.METER_CANDIDATES),
                  quantize_targets: bool = False,
@@ -155,8 +154,10 @@ class PLPhaseTimeRegression(LightningModule):
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
         self.fps = fps
-        self.lambda_phi = lambda_phi                # E-step (matching) weight
-        self.lambda_phi_mstep = lambda_phi_mstep    # M-step (gradient) weight, config.LAMBDA_PHI_MSTEP
+        # The phase weight is 1 / b_phi, learned per fragment by the model's
+        # phase ScaleHead (appendix "Calibrating the loss weights"). This only
+        # pins the E-step's copy of it when not None; see config.LAMBDA_PHI_ESTEP.
+        self.lambda_phi_estep = lambda_phi_estep
         self.lambda_R = lambda_R
         self.quantize_targets = quantize_targets
 
@@ -181,18 +182,18 @@ class PLPhaseTimeRegression(LightningModule):
     def _compute_loss(self, batch):
         # epoch, not None: None means "ScaleHead is already trained", which
         # would skip eq. (51)'s warm-start entirely for the whole run.
-        hat_phi, hat_t, b_e = self.model(batch["spect"], epoch=self.current_epoch)
+        hat_phi, hat_t, b_e, b_phi = self.model(batch["spect"], epoch=self.current_epoch)
         targets = fragment_targets(batch, self.fps, self.quantize_targets)
 
         N = hat_t.shape[1]
-        total, used, skipped = 0.0, 0, 0
+        total, used, skipped, nonfinite = 0.0, 0, 0, 0
 
         # b_e is per-fragment already; hat_phi/hat_t come back in whatever dtype
         # the precision plugin chose. The DP reads scalars through .item(), so it
         # is dtype-agnostic, but the circular arithmetic around 0/1 is not:
         # fp16 has ~3 decimal digits there, which is coarse next to tau = 0.2.
         # Compute the loss in fp32 and let autograd cast the gradient back.
-        hat_phi, hat_t, b_e = hat_phi.float(), hat_t.float(), b_e.float()
+        hat_phi, hat_t, b_e, b_phi = hat_phi.float(), hat_t.float(), b_e.float(), b_phi.float()
 
         # Per-fragment, not batched: M and N differ per fragment and the DP is
         # inherently sequential over its own (M, N). Same structure
@@ -209,31 +210,40 @@ class PLPhaseTimeRegression(LightningModule):
             if M < 2 or M > N:
                 skipped += 1
                 continue
+            # Non-finite outputs (fp16 overflow in the trunk) would poison the
+            # E-step's DP; drop the fragment and count it, so a run that starts
+            # producing NaN shows it in the logged 'nonfinite' rather than
+            # crashing or silently training on nothing.
+            if not (torch.isfinite(hat_t[i]).all() and torch.isfinite(hat_phi[i]).all()
+                    and torch.isfinite(b_e[i]) and torch.isfinite(b_phi[i])):
+                nonfinite += 1
+                continue
 
+            lam = phase_weight(b_phi[i], self.lambda_phi_estep)   # 1 / b_phi unless pinned
             if target["ind"] == 0:
                 hat_sigma, phi_i, unmatched, hyps = e_step(
-                    t_true, hat_t[i], hat_phi[i], b_e[i], self.lambda_phi,
+                    t_true, hat_t[i], hat_phi[i], b_e[i], lam,
                     ind=0, phi_true=target["phi_true"])
             else:
                 hat_sigma, phi_i, unmatched, hyps = e_step(
-                    t_true, hat_t[i], hat_phi[i], b_e[i], self.lambda_phi,
+                    t_true, hat_t[i], hat_phi[i], b_e[i], lam,
                     ind=1, meter_candidates=self.meter_candidates, pi_M=self.pi_M)
 
             # eq. (48)'s per-fragment gate: annotated downbeats + bar lengths
             # for ind=0 (None for ind=1), meter hypotheses for ind=1 (None
             # for ind=0). m_step_loss applies whichever is present.
             loss = m_step_loss(
-                hat_sigma, phi_i, t_true, hat_t[i], hat_phi[i], b_e[i],
-                self.lambda_phi, unmatched_agree=unmatched, lambda_R=self.lambda_R,
+                hat_sigma, phi_i, t_true, hat_t[i], hat_phi[i], b_e[i], b_phi[i],
+                unmatched_agree=unmatched, lambda_R=self.lambda_R,
                 downbeat_idx=target["downbeat_idx"], bar_lengths=target["bar_lengths"],
-                meter_hyps=hyps, lambda_phi_mstep=self.lambda_phi_mstep)
+                meter_hyps=hyps)
 
             total = total + loss
             used += 1
 
         if used == 0:
-            return None, {"used": 0, "skipped": skipped}
-        return total / used, {"used": used, "skipped": skipped}
+            return None, {"used": 0, "skipped": skipped, "nonfinite": nonfinite}
+        return total / used, {"used": used, "skipped": skipped, "nonfinite": nonfinite}
 
     def training_step(self, batch, batch_idx):
         loss, stats = self._compute_loss(batch)
@@ -245,6 +255,8 @@ class PLPhaseTimeRegression(LightningModule):
         self.log("train_loss", loss, batch_size=batch_size, prog_bar=True)
         self.log("train_fragments_used", float(stats["used"]), batch_size=batch_size)
         self.log("train_fragments_skipped", float(stats["skipped"]), batch_size=batch_size)
+        self.log("train_fragments_nonfinite", float(stats["nonfinite"]), batch_size=batch_size,
+                 prog_bar=stats["nonfinite"] > 0)
         return loss
 
     def validation_step(self, batch, batch_idx):

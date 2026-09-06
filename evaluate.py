@@ -38,7 +38,7 @@ import torch
 import config
 from pl_module import PLPhaseTimeRegression
 from stitching import stitch_piece
-from train_and_infer import decode, infer_meter, meter_consistency_correction
+from train_and_infer import decode, infer_meter, meter_consistency_correction, phase_weight
 
 MIN_EVENTS = 3          # score_fold0_dense.py's own threshold
 TRIM = 5.0              # eval_trim_beats, PLBeatThis's default
@@ -102,11 +102,12 @@ def metrics(truth, preds):
 def decode_excerpt(model, spect, args, device):
     """Section 5 on one fixed-length excerpt. Returns (beats, downbeats) in seconds."""
     with torch.no_grad():
-        hat_phi, hat_t, _ = model.model(spect.unsqueeze(0).to(device).float())
+        hat_phi, hat_t, _, b_phi = model.model(spect.unsqueeze(0).to(device).float())
     hat_phi, hat_t = hat_phi[0].float(), hat_t[0].float()
 
-    hat_L = infer_meter(hat_phi, args.meter_candidates,
-                        torch.tensor(args.pi_M), model.lambda_phi)
+    # the fragment's own 1 / b_phi, as in training, unless the E-step weight was pinned
+    hat_L = infer_meter(hat_phi, args.meter_candidates, torch.tensor(args.pi_M),
+                        phase_weight(b_phi[0].float(), getattr(model, "lambda_phi_estep", None)))
     p_hat, d, t_hat, B = decode(hat_phi, hat_t, hat_L, args.tau)
     B = meter_consistency_correction(B, hat_L, p_hat, d, t_hat, args.tau, args.tau_prime)
 
@@ -131,7 +132,8 @@ def score_checkpoint(model, loader, args, device):
                 beats, downbeats = stitch_piece(
                     batch["spect"][i], model.model, args.train_length, args.border,
                     args.fps, args.meter_candidates, torch.tensor(args.pi_M),
-                    args.tau, args.tau_prime, model.lambda_phi, device=device)
+                    args.tau, args.tau_prime, getattr(model, "lambda_phi_estep", None),
+                    device=device)
             else:
                 beats, downbeats = decode_excerpt(model, batch["spect"][i], args, device)
 
