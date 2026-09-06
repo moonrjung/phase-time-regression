@@ -54,7 +54,14 @@ def load_model(ckpt_path, device):
     """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     hp = dict(ckpt.get("hyper_parameters", {}))
-    accepted = set(inspect.signature(PLPhaseTimeRegression.__init__).parameters)
+    # PLPhaseTimeRegression forwards **model_kwargs to HybridBeatTracker, and
+    # save_hyperparameters stores them flat, so both signatures are accepted.
+    # Dropping the model's own args (as before) rebuilt every checkpoint with
+    # the DEFAULT architecture, which is wrong as soon as a default changes
+    # (time_reparam did).
+    from hybrid_beat_tracker import HybridBeatTracker
+    accepted = (set(inspect.signature(PLPhaseTimeRegression.__init__).parameters)
+                | set(inspect.signature(HybridBeatTracker.__init__).parameters)) - {"self", "model_kwargs"}
     dropped = sorted(k for k in hp if k not in accepted and k != "model_kwargs")
     if dropped:
         print(f"    ignoring retired hyper_parameters: {', '.join(dropped)}")

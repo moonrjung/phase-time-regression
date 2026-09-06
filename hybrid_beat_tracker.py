@@ -36,6 +36,7 @@ from heads import (
     ScaleHead,
     mean_pool_candidates,
     monotonic_time_reparam,
+    time_reparam,
     scale_with_warmup,
 )
 
@@ -64,8 +65,10 @@ class HybridBeatTracker(nn.Module):
                  warmup_epochs: int = config.WARMUP_EPOCHS,
                  ff_mult: int = config.FF_MULT,
                  dropout: dict = None,
-                 fragment_frames: int = config.TRAIN_LENGTH):
+                 fragment_frames: int = config.TRAIN_LENGTH,
+                 time_reparam: str = config.TIME_REPARAM):
         super().__init__()
+        self.time_reparam_kind = time_reparam
 
         # Instantiate their real model, but keep only the backbone. ff_mult and
         # dropout are BeatThis's own arguments, passed through at AlignBeat's
@@ -112,7 +115,7 @@ class HybridBeatTracker(nn.Module):
         tilde_z = self.candidate_attn(z)             # phase branch only
         hat_phi = self.phase_head(tilde_z)           # (batch, N), in [0, 1)
         r = self.reg_head(z)                         # (batch, N), raw scores
-        hat_t = monotonic_time_reparam(r)            # (batch, N), strictly increasing
+        hat_t = time_reparam(r, self.time_reparam_kind)   # (batch, N), strictly increasing
 
         z_bar = mean_pool_candidates(z)               # (batch, reduced_dim)
         if epoch is None:

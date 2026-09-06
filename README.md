@@ -74,9 +74,15 @@ nearest-grid-point decoding with the density-bias correction (eq. 67); and
 Not implemented, and not stubbed:
 
 - **`MixedMeterTarget` (Alg. 1)** — the forward-backward pass over the
-  mixed-meter DBN. Beat-only fragments therefore assume one meter per fragment
-  (`--beat-only-meter`, default 4) instead of marginalizing over the candidate
-  set.
+  mixed-meter DBN. In its place, beat-only fragments treat the meter as latent
+  over `--meter-candidates` (default `2 3 4 6`, prior `METER_PRIOR`): the
+  E-step resolves `φ₀` under every candidate and keeps the best by
+  cost − log π_M(L) (hard EM over L), and the periodicity term marginalizes
+  over all of them as a prior-weighted soft-min (`marginal_periodicity`). No
+  default meter is ever assigned. For fully-labeled fragments, eq. (48) uses
+  the annotated bar lengths, so `λ_R` is gated per fragment by what the
+  annotation provides, as the document specifies. Its default value in
+  `config.py` is a calibration, not a derivation; see the comment there.
 - **Soft EM and direct marginal SGD** (Algs. 7, 8) — `σ` is hardened, so this is
   Viterbi EM.
 - **The joint `(σ, φ₀)` recursion** (eqs. 43, 44). The E-step is the phase-blind

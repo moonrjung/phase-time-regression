@@ -16,6 +16,7 @@ not attempted here.
 """
 
 import math
+from typing import NamedTuple
 import os
 
 import numpy as np
@@ -96,14 +97,16 @@ def match_cost_matrix(t_true: torch.Tensor, phi_true: torch.Tensor,
 
 
 def eps_l1(t_hat: torch.Tensor, t_target: torch.Tensor, b: torch.Tensor,
-           eps: float = config.EPS) -> torch.Tensor:
+           eps: float = config.EPS_RESIDUAL) -> torch.Tensor:
     """alignbeat/criterion.py:96 eps_l1 -- eps-insensitive L1, exactly zero
-    within eps of the annotation, in the window-fraction units t_hat lives in."""
+    within eps of the annotation, in the window-fraction units t_hat lives in.
+    eps = 0 (config.EPS_RESIDUAL's default) is the document's plain |dt| / b;
+    see config.py for why the dead zone is off for this model."""
     return (t_hat - t_target).abs().sub(eps).clamp(min=0.0) / b
 
 
 def time_term(residual: torch.Tensor, b: torch.Tensor,
-              eps: float = config.EPS) -> torch.Tensor:
+              eps: float = config.EPS_NORM) -> torch.Tensor:
     """alignbeat/criterion.py:501 _per_candidate_time_term -- -log p(r | b) for
     the uniform-core / Laplace-tail density, gradient split so the timing
     channel moves hat_t and the precision channel moves b. residual is already
@@ -138,7 +141,14 @@ def l_agree(hat_phi: torch.Tensor, t_true: torch.Tensor, phi_true: torch.Tensor,
 
     span = (t_i1 - t_i).clamp_min(1e-8)
     w = (hat_t.detach() - t_i) / span
-    target = (phi_i + w * (phi_i1 - phi_i)) % 1.0
+    # Interpolate along the SHORTEST ARC of the circle, not along the raw
+    # numbers. Phase advances by +1/L from beat to beat, so across the bar
+    # boundary it goes 0.75 -> 0.0 by wrapping UP through 0.83, 0.92; the raw
+    # difference (-0.75) would send the target DOWN through 0.5 and 0.25 --
+    # exactly onto grid points -- and decode then emitted those unmatched
+    # candidates as beats (measured: 1 extra beat per bar on a fitted batch).
+    delta = ((phi_i1 - phi_i + 0.5) % 1.0) - 0.5          # signed, in (-0.5, 0.5]
+    target = (phi_i + w * delta) % 1.0
     return circ_dist(hat_phi, target.detach())
 
 
@@ -206,10 +216,17 @@ def subset_select_dp(cost: torch.Tensor, agree: torch.Tensor | None = None):
 
 def hard_phi0(hat_sigma: torch.Tensor, hat_phi: torch.Tensor, L: int,
               lambda_phi: float, pi_L: torch.Tensor) -> tuple[int, torch.Tensor]:
-    """Section 2.4's hard phi_0 construction, single known L: for each of the
-    L hypotheses p, score sum_i lambda_phi * d_circ((p+i-1)/L, hat_phi_sigma(i)),
-    weighted by the learned prior pi_L. Returns (best p, per-event phi_i under
-    that p) -- phi_i for event i is ((p + i - 1) % L) / L."""
+    """Section 2.4's hard phi_0 construction for ONE meter hypothesis L: for
+    each of the L offsets p, score sum_i lambda_phi * d_circ((p+i-1)/L,
+    hat_phi_sigma(i)) - log pi_L[p]. Returns (best p, per-event phi_i under
+    that p, that best cost) -- phi_i for event i is ((p + i - 1) % L) / L.
+
+    The cost is returned so that a caller trying several L can compare the
+    hypotheses: it is the negative log of the (unnormalised) joint of the
+    matched phases and phi_0 under L. No L-dependent bias correction is
+    needed here, unlike infer_meter's -N/(4L): the implied phases are a
+    fixed progression, so under a random hat_phi the expected circular
+    distance is 1/4 for every L, not 1/(4L)."""
     M = hat_sigma.shape[0]
     matched_phi = hat_phi[hat_sigma - 1]  # (M,), hat_phi_{sigma(i)} for each i
     best_cost, best_p = float("inf"), 0
@@ -222,19 +239,49 @@ def hard_phi0(hat_sigma: torch.Tensor, hat_phi: torch.Tensor, L: int,
             best_cost, best_p = cost.item(), p
     phi_i = torch.tensor([((best_p + i) % L) / L for i in range(M)],
                          device=device, dtype=dtype)
-    return best_p, phi_i
+    return best_p, phi_i, best_cost
+
+
+class MeterHypothesis(NamedTuple):
+    """One candidate meter L for a beat-only fragment, after hard phi_0
+    resolution under that L. Produced by e_step (ind=1), consumed by
+    m_step_loss's marginal periodicity term."""
+    L: int
+    log_prior: float        # log pi_M(L), the corpus meter prior (eq. 4)
+    phi_i: torch.Tensor     # (M,) resolved phases of the matched events under L
+    score: float            # hard_phi0's cost - log pi_M(L): lower is better
 
 
 def e_step(t_true: torch.Tensor, hat_t: torch.Tensor, hat_phi: torch.Tensor,
            b_e: torch.Tensor, lambda_phi: float, ind: int,
-           phi_true: torch.Tensor | None = None, L: int | None = None,
-           pi_L: torch.Tensor | None = None):
-    """Algorithm 4: EStep. ind=0 (fully-labeled): phi_true given directly,
-    L_agree computable upfront and folded into the DP's skip cost. ind=1
-    (beat-only, single known L): phase-blind search (timing alone), then
-    hard phi_0 resolution given the now-fixed hat_sigma, then L_agree
-    computed for the leftover unmatched candidates.
-    Returns (hat_sigma, phi_i_for_matched_events, agree_for_unmatched)."""
+           phi_true: torch.Tensor | None = None,
+           meter_candidates: list[int] | None = None,
+           pi_M: torch.Tensor | list[float] | None = None,
+           pi_L: dict[int, torch.Tensor] | None = None):
+    """Algorithm 4: EStep.
+
+    ind=0 (fully-labeled): phi_true given directly, L_agree computable
+    upfront and folded into the DP's skip cost.
+
+    ind=1 (beat-only): the meter L is LATENT. Section 2.5 says a beat-only
+    track carries no meter information of its own, and the eq. (48)
+    discussion forbids "assigning an incorrect default meter". So instead
+    of one assumed L, every candidate meter in `meter_candidates` (the
+    document's own set, eq. 4's pi_M) is tried:
+      1. phase-blind search on timing alone -- the DP does not depend on L,
+         so hat_sigma is shared by every hypothesis;
+      2. for EACH L, the hard phi_0 resolution of Section 2.4 (hard_phi0),
+         giving per-L phases phi_i^L and a cost;
+      3. the meter with the lowest cost - log pi_M(L) is the hard-EM choice
+         hat_L. Its phi_i^L feeds the phase term and L_agree, exactly as the
+         single-L version did;
+      4. ALL hypotheses are returned as MeterHypothesis records so that the
+         M-step can marginalise the periodicity regulariser over L rather
+         than trusting hat_L alone (see m_step_loss).
+    pi_L maps each L to its phi_0 prior (eq. 25); None means uniform.
+
+    Returns (hat_sigma, phi_i_for_matched_events, agree_for_unmatched,
+    meter_hypotheses_or_None)."""
     if ind == 0:
         assert phi_true is not None
         agree = l_agree(hat_phi, t_true, phi_true, hat_t)
@@ -253,14 +300,29 @@ def e_step(t_true: torch.Tensor, hat_t: torch.Tensor, hat_phi: torch.Tensor,
             agree_unmatched = agree[unmatched_idx]
         else:
             agree_unmatched = torch.zeros(0)
-        return hat_sigma, phi_true.detach(), (unmatched, agree_unmatched)
+        return hat_sigma, phi_true.detach(), (unmatched, agree_unmatched), None
     else:
-        assert L is not None and pi_L is not None
+        assert meter_candidates is not None and pi_M is not None, \
+            "beat-only fragments need the candidate meter set and its prior"
         cost = match_cost_matrix(t_true, None, hat_t, hat_phi, b_e, lambda_phi, phase_blind=True)
         hat_sigma = subset_select_dp(cost)  # no skip cost yet -- phi unknown
         hat_sigma = hat_sigma.detach()
-        _, phi_i = hard_phi0(hat_sigma, hat_phi.detach(), L, lambda_phi,
-                             pi_L.to(hat_phi.device))
+
+        # One phi_0 resolution per candidate meter. hat_phi is detached: the
+        # E-step decides, the M-step differentiates (Algorithm 3).
+        hyps = []
+        for idx, L in enumerate(meter_candidates):
+            if pi_L is not None and L in pi_L:
+                pi_L_of_L = pi_L[L].to(hat_phi.device)
+            else:
+                pi_L_of_L = torch.full((L,), 1.0 / L, device=hat_phi.device)
+            _, phi_L, cost_L = hard_phi0(hat_sigma, hat_phi.detach(), L, lambda_phi, pi_L_of_L)
+            log_prior = math.log(float(pi_M[idx]) + 1e-12)
+            hyps.append(MeterHypothesis(L=L, log_prior=log_prior, phi_i=phi_L,
+                                        score=cost_L - log_prior))
+        best = min(hyps, key=lambda h: h.score)     # hard-EM over L
+        phi_i = best.phi_i
+
         matched = set(hat_sigma.tolist())          # built once, not per candidate
         unmatched = [j for j in range(1, hat_t.shape[0] + 1) if j not in matched]
         if unmatched:
@@ -268,20 +330,100 @@ def e_step(t_true: torch.Tensor, hat_t: torch.Tensor, hat_phi: torch.Tensor,
             agree = l_agree(hat_phi[unmatched_idx], t_true, phi_i, hat_t[unmatched_idx])
         else:
             agree = torch.zeros(0)
-        return hat_sigma, phi_i.detach(), (unmatched, agree)
+        return hat_sigma, phi_i.detach(), (unmatched, agree), hyps
+
+
+def periodicity_R(matched_t: torch.Tensor, downbeat_idx: torch.Tensor,
+                  bar_lengths: torch.Tensor) -> torch.Tensor:
+    """eq. (48): R = sum_k ( t_sigma(i_{k+1}) - t_sigma(i_k) - L_k * Delta_bar )^2.
+
+    matched_t:    (M,) predicted times of the matched events, in time order.
+    downbeat_idx: (K,) event indices i_1 < ... < i_K of the downbeats.
+    bar_lengths:  (K-1,) beats per bar between consecutive downbeats, L_k.
+                  The document writes a single per-track L; passing it per
+                  bar is the same thing for a constant meter and stays
+                  correct when the meter changes inside the fragment
+                  (Section 3.1), which phases_from_downbeats already handles
+                  the same way.
+    Delta_bar is the model's own mean beat period over the matched events,
+    the model-dependent quantity the document writes as Delta_bar(theta, x).
+    Gradient flows through the predicted times only; L_k is data."""
+    db_times = matched_t[downbeat_idx]
+    spacings = db_times[1:] - db_times[:-1]
+    M = matched_t.shape[0]
+    delta_bar = (matched_t[-1] - matched_t[0]) / max(M - 1, 1)
+    expected = bar_lengths.to(spacings) * delta_bar
+    return ((spacings - expected) ** 2).sum()
+
+
+def marginal_periodicity(matched_t: torch.Tensor, meter_hyps: list,
+                         lambda_R: float) -> torch.Tensor | None:
+    """The periodicity term for a beat-only fragment, where L is unknown.
+
+    The document's eq. (48) discussion excludes such fragments from R rather
+    than assign a default meter. This goes one step further and MARGINALISES
+    over the candidate meters instead of excluding them: treat
+    exp(-lambda_R * R_L) as the likelihood of the predicted downbeat spacing
+    under meter L, weight by the corpus prior pi_M(L), and take the
+    negative log of the sum:
+
+        R_marg = -log sum_L pi_M(L) exp(-lambda_R * R_L)
+
+    Why this form and not the average of R_L over L: the average is
+    minimised at a spacing of E[L] * Delta_bar, about 3.7 beats under the
+    corpus prior, which is the bar length of no meter at all. The soft-min
+    above is minimised at L * Delta_bar for whichever L fits best, so it
+    still pushes toward SOME periodic bar structure while letting the data
+    overrule the prior -- e.g. a clear 3/4 piece wins against the 0.86 prior
+    mass on 4/4 once its R_3 is small enough.
+
+    Each R_L is evaluated on that L's OWN downbeat set, i.e. the phi_i^L that
+    hard_phi0 resolved under L, so hypothesis and penalty are consistent. A
+    hypothesis with fewer than two downbeats has no spacing to penalise and
+    is dropped, with the prior renormalised over the survivors, so that R
+    identically zero gives a term of exactly zero. Returns None when no
+    hypothesis survives."""
+    log_priors, log_liks = [], []
+    for h in meter_hyps:
+        db_idx = torch.nonzero(h.phi_i == 0.0).flatten()
+        if db_idx.numel() < 2:
+            continue
+        bar_lengths = torch.full((db_idx.numel() - 1,), float(h.L), device=matched_t.device)
+        R_L = periodicity_R(matched_t, db_idx, bar_lengths)
+        log_priors.append(torch.tensor(h.log_prior, device=matched_t.device))
+        log_liks.append(-lambda_R * R_L)
+    if not log_liks:
+        return None
+    log_priors = torch.stack(log_priors)
+    log_joint = log_priors + torch.stack(log_liks)
+    # -log sum_L pi(L) e^{-lambda R_L}, with pi renormalised over the survivors
+    return -(torch.logsumexp(log_joint, dim=0) - torch.logsumexp(log_priors, dim=0))
 
 
 def m_step_loss(hat_sigma: torch.Tensor, phi_i: torch.Tensor,
                  t_true: torch.Tensor, hat_t: torch.Tensor, hat_phi: torch.Tensor,
                  b_e: torch.Tensor, lambda_phi: float,
                  unmatched_agree=None, lambda_R: float = 0.0,
-                 downbeat_mask: torch.Tensor | None = None) -> torch.Tensor:
+                 downbeat_idx: torch.Tensor | None = None,
+                 bar_lengths: torch.Tensor | None = None,
+                 meter_hyps: list | None = None,
+                 lambda_phi_mstep: float | None = None) -> torch.Tensor:
     """Algorithm 5: MStep. Assembles eq. (totalloss)'s per-fragment summand:
     matched timing+phase terms (eps-insensitive, with AlignBeat's bounded
     log(2 eps + 2 b_e) normaliser; AlignBeat's Gamma precision prior is
-    deliberately NOT carried over),
-    L_agree over unmatched candidates (if given), and the periodicity
-    regularizer (if lambda_R > 0 and >=2 downbeats matched)."""
+    deliberately NOT carried over), L_agree over unmatched candidates (if
+    given), and the periodicity regulariser of eq. (48).
+
+    The regulariser is gated PER FRAGMENT by what the annotation provides,
+    which is how the document specifies lambda_R ("for meter-unlabeled
+    tracks, lambda_R is set to 0 for that fragment"):
+      * fully-labeled fragment: pass downbeat_idx and bar_lengths, both read
+        off the annotation (fragment_targets). R uses the annotated L.
+      * beat-only fragment: pass meter_hyps from e_step. R is marginalised
+        over the candidate meters (marginal_periodicity) -- the document
+        would set lambda_R = 0 here; see that function for why this is a
+        strictly milder choice than assuming a default meter.
+      * neither given, or lambda_R == 0: no regulariser, eq. (22) exactly."""
     matched_t = hat_t[hat_sigma - 1]
     matched_phi = hat_phi[hat_sigma - 1]
 
@@ -289,44 +431,63 @@ def m_step_loss(hat_sigma: torch.Tensor, phi_i: torch.Tensor,
     # with the per-fragment b_e standing in for its per-candidate b_j:
     # eps-insensitive residual and the bounded normaliser log(2 eps + 2 b_e)
     # per event. The M log(2 b_e) of eq. (totalloss) is the eps=0 case.
-    residual = (t_true - matched_t).abs().sub(config.EPS).clamp(min=0.0)
+    residual = (t_true - matched_t).abs().sub(config.EPS_RESIDUAL).clamp(min=0.0)
     timing_term = time_term(residual, b_e).sum()
-    phase_term = lambda_phi * circ_dist(phi_i, matched_phi).sum()
+    # The phase weight here is the M-step (gradient-balance) weight, which is
+    # deliberately not the E-step's matching weight; see config.LAMBDA_PHI_MSTEP.
+    lambda_phi_m = config.LAMBDA_PHI_MSTEP if lambda_phi_mstep is None else lambda_phi_mstep
+    phase_term = lambda_phi_m * circ_dist(phi_i, matched_phi).sum()
 
     loss = timing_term + phase_term
 
     if unmatched_agree is not None:
         _, agree_vals = unmatched_agree
         if agree_vals.numel() > 0:
-            loss = loss + agree_vals.sum()
+            # L_agree is a bare circular distance (l_agree). It is the ONLY
+            # training signal the unmatched candidates' phases get, and decode
+            # relies on those phases sitting OFF the grid (interpolated between
+            # the bracketing beats) to reject them. Weighted 1 against a phase
+            # term weighted lambda_phi_m, they were not trained at all: on a
+            # fitted batch every unmatched candidate simply copied the
+            # neighbouring beat's phase and decode emitted 2 candidates per
+            # beat. Same weight as the matched phase term, for the same reason.
+            loss = loss + lambda_phi_m * agree_vals.sum()
 
-    if lambda_R > 0 and downbeat_mask is not None and downbeat_mask.sum() >= 2:
-        db_times = matched_t[downbeat_mask]
-        spacings = db_times[1:] - db_times[:-1]
-        mean_spacing = (matched_t[-1] - matched_t[0]) / max(matched_t.shape[0] - 1, 1)
-        L_est = spacings.mean() / mean_spacing if mean_spacing > 0 else torch.tensor(1.0)
-        expected = L_est * mean_spacing
-        R = ((spacings - expected) ** 2).sum()
-        loss = loss + lambda_R * R
+    if lambda_R > 0:
+        if downbeat_idx is not None and bar_lengths is not None and downbeat_idx.numel() >= 2:
+            # Annotated meter available: eq. (48) as written.
+            loss = loss + lambda_R * periodicity_R(matched_t, downbeat_idx, bar_lengths)
+        elif meter_hyps is not None:
+            # Meter latent: marginal over the candidate meters.
+            R_marg = marginal_periodicity(matched_t, meter_hyps, lambda_R)
+            if R_marg is not None:
+                loss = loss + R_marg
 
     return loss
 
 
 def train_step(model, x: torch.Tensor, t_true: torch.Tensor, ind: int,
-                phi_true: torch.Tensor | None, L: int | None, pi_L: torch.Tensor | None,
+                phi_true: torch.Tensor | None,
+                downbeat_idx: torch.Tensor | None, bar_lengths: torch.Tensor | None,
                 epoch: int, lambda_phi: float = config.LAMBDA_PHI,
-                lambda_R: float = config.LAMBDA_R):
+                lambda_R: float = config.LAMBDA_R,
+                meter_candidates: list[int] = config.METER_CANDIDATES,
+                pi_M: list[float] = config.PI_M):
     """Algorithm 3: one fragment's training step. Runs the model forward,
     resolves (hat_sigma, phi_i) via the E-step, and returns the M-step loss
-    -- ready for loss.backward() and an optimizer step by the caller."""
+    -- ready for loss.backward() and an optimizer step by the caller.
+    downbeat_idx / bar_lengths are the annotation's downbeats (ind=0 only);
+    for ind=1 the meter is latent and comes from meter_candidates / pi_M."""
     hat_phi, hat_t, b_e = model(x, epoch=epoch)
     hat_phi, hat_t, b_e = hat_phi[0], hat_t[0], b_e[0]  # drop the batch dim (batch=1 only)
 
-    hat_sigma, phi_i, unmatched = e_step(t_true, hat_t, hat_phi, b_e, lambda_phi, ind,
-                                          phi_true=phi_true, L=L, pi_L=pi_L)
-    downbeat_mask = (phi_i == 0.0) if ind == 1 else (phi_true == 0.0)
+    hat_sigma, phi_i, unmatched, hyps = e_step(
+        t_true, hat_t, hat_phi, b_e, lambda_phi, ind, phi_true=phi_true,
+        meter_candidates=meter_candidates, pi_M=pi_M)
     loss = m_step_loss(hat_sigma, phi_i, t_true, hat_t, hat_phi, b_e, lambda_phi,
-                        unmatched_agree=unmatched, lambda_R=lambda_R, downbeat_mask=downbeat_mask)
+                        unmatched_agree=unmatched, lambda_R=lambda_R,
+                        downbeat_idx=downbeat_idx, bar_lengths=bar_lengths,
+                        meter_hyps=hyps)
     return loss
 
 
@@ -336,8 +497,8 @@ def training_loop(model, dataset, n_epochs: int = config.MAX_EPOCHS,
                    weight_decay: float = config.WEIGHT_DECAY,
                    warmup_steps: int = config.WARMUP_STEPS):
     """Algorithm 6: minibatch training loop, batch size 1 (see module
-    docstring). dataset: list of (x, t_true, ind, phi_true_or_None, L_or_None,
-    pi_L_or_None) tuples, one per fragment."""
+    docstring). dataset: list of (x, t_true, ind, phi_true_or_None,
+    downbeat_idx_or_None, bar_lengths_or_None) tuples, one per fragment."""
     # AdamW + linear warmup then cosine decay, exactly AlignBeat's own optimizer
     # and CosineWarmupScheduler (pl_module.py:466, 506, 548).
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -352,9 +513,10 @@ def training_loop(model, dataset, n_epochs: int = config.MAX_EPOCHS,
     history = []
     for epoch in range(1, n_epochs + 1):
         epoch_loss = 0.0
-        for x, t_true, ind, phi_true, L, pi_L in dataset:
+        for x, t_true, ind, phi_true, downbeat_idx, bar_lengths in dataset:
             optimizer.zero_grad()
-            loss = train_step(model, x, t_true, ind, phi_true, L, pi_L, epoch, lambda_phi, lambda_R)
+            loss = train_step(model, x, t_true, ind, phi_true, downbeat_idx, bar_lengths,
+                              epoch, lambda_phi, lambda_R)
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -386,22 +548,73 @@ def infer_meter(hat_phi: torch.Tensor, candidate_meters: list[int],
     return best_ell
 
 
-def decode(hat_phi: torch.Tensor, hat_t: torch.Tensor, hat_L: int, tau: float):
+def decode_threshold(tau: float, hat_L: int,
+                     grid_relative: bool = config.TAU_GRID_RELATIVE) -> float:
+    """The d_j threshold actually applied: tau / L when grid-relative (tau in
+    beats), else the document's bare tau. See config.TAU_GRID_RELATIVE."""
+    return tau / hat_L if grid_relative else tau
+
+
+def merge_duplicates(p_hat: list, d: list, t_hat: list, keep: list) -> list:
+    """One emission per grid slot per bar (config.DECODE_MERGE).
+
+    keep: per-candidate acceptance flags from the tau test. Walk the accepted
+    candidates in time order; when the next one carries the SAME p_hat as the
+    last kept and follows it by less than half a beat period, the two are the
+    same beat seen by neighbouring candidates -- keep whichever is nearer its
+    grid point. The beat period is estimated from the accepted candidates
+    themselves: the median time between consecutive accepted candidates whose
+    p_hat advances by exactly one slot, which is what genuine consecutive
+    beats do; if no such pair exists, the median gap of all accepted ones."""
+    idx = [j for j in range(len(keep)) if keep[j]]
+    if len(idx) < 3:
+        return keep
+    L = max(p_hat) + 1 if p_hat else 1
+    advancing = [t_hat[b] - t_hat[a] for a, b in zip(idx, idx[1:])
+                 if (p_hat[b] - p_hat[a]) % L == 1 and t_hat[b] > t_hat[a]]
+    gaps = advancing if advancing else [t_hat[b] - t_hat[a] for a, b in zip(idx, idx[1:])]
+    period = sorted(gaps)[len(gaps) // 2]
+    out = [False] * len(keep)
+    last = None
+    for j in idx:
+        if last is not None and p_hat[j] == p_hat[last] and t_hat[j] - t_hat[last] < 0.5 * period:
+            if d[j] < d[last]:
+                out[last], out[j], last = False, True, j
+            continue
+        out[j], last = True, j
+    return out
+
+
+def decode(hat_phi: torch.Tensor, hat_t: torch.Tensor, hat_L: int, tau: float,
+           grid_relative: bool = config.TAU_GRID_RELATIVE,
+           merge: bool = config.DECODE_MERGE):
     """Algorithm 9, lines 21-28: nearest-grid-point decoding given hat_L.
     Returns lists (p_hat, d, t_hat) for every candidate, and B = the
     accepted (p_hat, t_hat) pairs, in time order (guaranteed by hat_t's
-    own strict monotonicity)."""
+    own strict monotonicity). Two departures from the document, both
+    off-switchable and explained in config.py: the threshold is tau / L
+    (TAU_GRID_RELATIVE) and near-duplicate emissions are merged
+    (DECODE_MERGE)."""
     N = hat_phi.shape[0]
     p_hat = torch.round(hat_phi * hat_L).long() % hat_L
     grid_vals = p_hat.float() / hat_L
     d = circ_dist(hat_phi, grid_vals)
-    B = [(p_hat[j].item(), hat_t[j].item()) for j in range(N) if d[j].item() <= tau]
-    return p_hat.tolist(), d.tolist(), hat_t.tolist(), B
+    thr = decode_threshold(tau, hat_L, grid_relative)
+    p_l, d_l, t_l = p_hat.tolist(), d.tolist(), hat_t.tolist()
+    keep = [d_l[j] <= thr for j in range(N)]
+    if merge:
+        keep = merge_duplicates(p_l, d_l, t_l, keep)
+    B = [(p_l[j], t_l[j]) for j in range(N) if keep[j]]
+    return p_l, d_l, t_l, B
 
 
 def meter_consistency_correction(B: list, hat_L: int, p_hat: list, d: list, t_hat: list,
                                   tau: float, tau_prime: float):
-    """Algorithm 10: gap-filling and pruning."""
+    """Algorithm 10: gap-filling and pruning. tau and tau_prime are scaled the
+    same way decode scales them (decode_threshold), so a downbeat that decode
+    accepted is a downbeat here too."""
+    tau = decode_threshold(tau, hat_L)
+    tau_prime = decode_threshold(tau_prime, hat_L)
     downbeats = sorted([j for j in range(len(p_hat)) if p_hat[j] == 0 and d[j] <= tau], key=lambda j: t_hat[j])
     if len(B) < 2 or len(downbeats) < 2:
         return B
@@ -509,8 +722,9 @@ if __name__ == "__main__":
     hat_t2 = hat_t.clone().requires_grad_(True)
     hat_phi2 = hat_phi.clone().requires_grad_(True)
     b_e2 = torch.tensor(0.05, requires_grad=True)
-    hs, phi_i, unmatched = e_step(t_true, hat_t2, hat_phi2, b_e2, lambda_phi=config.LAMBDA_PHI, ind=0, phi_true=phi_true)
+    hs, phi_i, unmatched, hyps0 = e_step(t_true, hat_t2, hat_phi2, b_e2, lambda_phi=config.LAMBDA_PHI, ind=0, phi_true=phi_true)
     print("hat_sigma:", hs.tolist(), " requires_grad:", hs.requires_grad if hasattr(hs, 'requires_grad') else False)
+    print("meter hypotheses for ind=0 (should be None):", hyps0)
     loss = m_step_loss(hs, phi_i, t_true, hat_t2, hat_phi2, b_e2, lambda_phi=config.LAMBDA_PHI, unmatched_agree=unmatched)
     print("loss:", loss.item())
     loss.backward()
@@ -518,22 +732,37 @@ if __name__ == "__main__":
     print("grad flows to hat_phi:", hat_phi2.grad is not None and hat_phi2.grad.abs().sum() > 0)
     print("grad flows to b_e:", b_e2.grad is not None and b_e2.grad.abs().sum() > 0)
 
-    print("\n=== E-step / M-step, ind=1 (beat-only, single known L) ===")
-    L = 4
-    pi_L = torch.full((L,), 1.0 / L)
+    print("\n=== E-step / M-step, ind=1 (beat-only, latent meter) ===")
     hat_t3 = torch.sort(torch.rand(N))[0].requires_grad_(True)
     hat_phi3 = torch.rand(N, requires_grad=True)
     b_e3 = torch.tensor(0.05, requires_grad=True)
-    hs2, phi_i2, unmatched2 = e_step(t_true, hat_t3, hat_phi3, b_e3, lambda_phi=config.LAMBDA_PHI, ind=1, L=L, pi_L=pi_L)
+    hs2, phi_i2, unmatched2, hyps = e_step(t_true, hat_t3, hat_phi3, b_e3, lambda_phi=config.LAMBDA_PHI, ind=1,
+                                           meter_candidates=config.METER_CANDIDATES, pi_M=config.PI_M)
     print("hat_sigma:", hs2.tolist(), "phi_i (resolved, detached):", phi_i2.tolist())
     print("phi_i requires_grad (should be False):", phi_i2.requires_grad)
-    downbeat_mask = (phi_i2 == 0.0)
+    print("meter hypotheses (L, score):", [(h.L, round(h.score, 3)) for h in hyps],
+          "-> hat_L =", min(hyps, key=lambda h: h.score).L)
     loss2 = m_step_loss(hs2, phi_i2, t_true, hat_t3, hat_phi3, b_e3, lambda_phi=config.LAMBDA_PHI,
-                         unmatched_agree=unmatched2, lambda_R=0.1, downbeat_mask=downbeat_mask)
+                         unmatched_agree=unmatched2, lambda_R=config.LAMBDA_R, meter_hyps=hyps)
     print("loss:", loss2.item())
     loss2.backward()
     print("grad flows to hat_t:", hat_t3.grad is not None and hat_t3.grad.abs().sum() > 0)
     print("grad flows to hat_phi:", hat_phi3.grad is not None and hat_phi3.grad.abs().sum() > 0)
+
+    print("\n=== Periodicity regulariser, eq. (48), on a synthetic 4/4 fragment ===")
+    # 12 beats at a constant period; downbeats every 4 -> R must be 0 with the
+    # annotated L=4 and grow as one downbeat is displaced.
+    period = 1.0 / 13
+    beats = torch.arange(1, 13, dtype=torch.float32) * period
+    db_idx = torch.tensor([0, 4, 8])
+    bars = torch.tensor([4.0, 4.0])
+    print("R at the truth:", round(periodicity_R(beats, db_idx, bars).item(), 8), "(should be 0)")
+    shifted = beats.clone(); shifted[4] += 0.5 * period
+    print("R with one downbeat late by half a beat:", round(periodicity_R(shifted, db_idx, bars).item(), 8))
+    fake_hyps = [MeterHypothesis(L=L, log_prior=math.log(p), phi_i=torch.tensor([((i) % L) / L for i in range(12)]),
+                                 score=0.0) for L, p in zip(config.METER_CANDIDATES, config.PI_M)]
+    Rm = marginal_periodicity(beats, fake_hyps, config.LAMBDA_R)
+    print("marginal R on the same beats (every L fits a constant period equally, so ~0):", round(Rm.item(), 8))
 
     print("\n=== Full training loop, real hybrid model, synthetic data ===")
     from hybrid_beat_tracker import HybridBeatTracker
@@ -550,11 +779,12 @@ if __name__ == "__main__":
         if ind == 0:
             L = 4
             phi_true = torch.tensor([((i) % L) / L for i in range(M)])
-            return x, t_true, ind, phi_true, None, None
+            downbeat_idx = torch.arange(0, M, L)
+            bar_lengths = torch.full((downbeat_idx.numel() - 1,), float(L))
+            return x, t_true, ind, phi_true, downbeat_idx, bar_lengths
         else:
-            L = 4
-            pi_L = torch.full((L,), 1.0 / L)
-            return x, t_true, ind, None, L, pi_L
+            # beat-only: no meter of its own; e_step tries config.METER_CANDIDATES
+            return x, t_true, ind, None, None, None
 
     # M = 60 events in 30 s is an ordinary 120 BPM; N = 188 leaves ample slack,
     # exactly the overgeneration the formulation expects.

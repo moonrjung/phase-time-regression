@@ -193,7 +193,8 @@ class ScaleHead(nn.Module):
     NOT the per-candidate z_j -- since timing spread is a property of the
     whole fragment, not of any one candidate."""
 
-    def __init__(self, d_model: int, hidden: int = 128, b_min: float = 1e-3):
+    def __init__(self, d_model: int, hidden: int = 128, b_min: float = 1e-3,
+                 b_init: float = config.B_0):
         super().__init__()
         self.b_min = b_min
         self.net = nn.Sequential(
@@ -201,6 +202,17 @@ class ScaleHead(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, 1),
         )
+        # Start the head AT b_0, so eq. (51)'s hand-over from the fixed b_0 to
+        # the learned b_e is continuous. Without this the untrained head emits
+        # softplus(random) + b_min, measured at 18-23 SECONDS on real data
+        # (the sweep's lambda_phi=30 runs never recovered from that jump; the
+        # loss rose from ~200 to ~450 at the hand-over epoch and stayed there).
+        # Zero last-layer weights and a bias of softplus^-1(b_0 - b_min) give
+        # exactly b_0 for every input; the weights then learn deviations.
+        last = self.net[-1]
+        nn.init.zeros_(last.weight)
+        target = max(b_init - b_min, 1e-6)
+        nn.init.constant_(last.bias, math.log(math.expm1(target)))
 
     def forward(self, z_bar: torch.Tensor) -> torch.Tensor:
         # z_bar: (batch, d_model) -> b_e: (batch,), always > b_min
@@ -236,6 +248,24 @@ def monotonic_time_reparam(r: torch.Tensor) -> torch.Tensor:
     cum = torch.cumsum(sp, dim=-1)        # (batch, N)
     Z = cum[..., -1:]                     # (batch, 1), total sum
     return cum / Z
+
+
+def local_time_reparam(r: torch.Tensor) -> torch.Tensor:
+    """config.TIME_REPARAM = "local": hat_t_j = (j + 0.5 + 0.5 tanh(r_j)) / N.
+    Candidate j owns the slot (j/N, (j+1)/N) and moves within it, so the
+    sequence is strictly increasing without any cumulative coupling between
+    candidates -- see config.py for why eq. (monotone)'s cumsum did not train."""
+    N = r.shape[-1]
+    j = torch.arange(N, device=r.device, dtype=r.dtype)
+    return (j + 0.5 + 0.5 * torch.tanh(r)) / N
+
+
+def time_reparam(r: torch.Tensor, kind: str = config.TIME_REPARAM) -> torch.Tensor:
+    if kind == "monotone":
+        return monotonic_time_reparam(r)
+    if kind == "local":
+        return local_time_reparam(r)
+    raise ValueError(f"unknown time reparameterisation {kind!r}; 'monotone' or 'local'")
 
 
 class SharedProjection(nn.Module):

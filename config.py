@@ -92,6 +92,25 @@ PI_M = [METER_PRIOR[l] for l in METER_CANDIDATES]
 F_MEASURE_TOLERANCE = 0.07   # seconds; the standard beat-tracking window
 TAU = 0.2                    # --tau_beat == --tau_downbeat == 0.2
 
+# How tau is applied in decode (Algorithm 9). The document tests d_j <= tau
+# with d_j the circular distance to the nearest grid point k/L. The grid's
+# points are 1/L apart, so the LARGEST d any phase can have is 1/(2L): 0.167
+# for L=3, 0.125 for L=4. A fixed tau = 0.2 therefore accepts EVERY candidate
+# for L >= 3, and F sat at 0.43 with all 188 candidates emitted whatever the
+# model had learned. tau only means anything as a fraction of the grid
+# spacing, so the threshold is tau / L: a candidate is kept when it sits
+# within tau of a grid point IN BEATS. Measured on a fitted batch: fixed tau
+# F = 0.43, tau/L with merge F = 0.97.
+TAU_GRID_RELATIVE = True
+
+# Decode merge. With ~3 candidates per beat interval (188 over 30 s against
+# ~2 beats/s), the candidates just before and just after a beat interpolate
+# to phases within a few hundredths of the beat's grid point and pass any
+# usable tau, so decode emitted ~2 candidates per beat. One emission per grid
+# slot per bar: among accepted candidates closer in time than half a beat
+# period with the same p_hat, keep the one nearest the grid.
+DECODE_MERGE = True
+
 # NO ALIGNBEAT COUNTERPART. tau' only exists in this document (Algorithm 10's
 # gap-filling); AlignBeat has a single threshold. Section 5.2's own suggested
 # starting point is tau' ~ 1.5 tau, to be swept on held-out data.
@@ -107,11 +126,34 @@ TAU_PRIME = 1.5 * TAU        # 0.3
 # 3.3-3.4 use lambda_phi = 3.0) and flagged as needing its own sweep.
 LAMBDA_PHI = 3.0
 
-# AlignBeat's README lists a --lambda_r flag for the periodicity regularizer,
-# but no such argument exists anywhere in launch_scripts/train.py or the
-# alignbeat package -- the regularizer is documented, not wired up. Off is
-# therefore what AlignBeat actually runs, and eq. (53)'s third line vanishes.
-LAMBDA_R = 0.0
+# lambda_phi does TWO jobs that want different values. In the E-step it
+# trades phase against timing when deciding WHICH candidate matches an event
+# (eqs. matchcost); there 3 is fine and 30 broke the matching (candidates
+# chosen by phase agreement, not by time, so the timing head never got a
+# clean signal). In the M-step it sets the phase gradient's magnitude against
+# the timing gradient's, and the timing gradient is residual / b_e per event,
+# i.e. 1/b_e ~ 400 at b_0 and larger once b_e shrinks; measured 80-150x the
+# phase gradient. The shared trunk follows the larger one, so the phase head
+# sees only noise unless the M-step weight is of that order. This is the
+# M-step (loss) weight; LAMBDA_PHI above stays the E-step (matching) weight.
+LAMBDA_PHI_MSTEP = 100.0
+
+
+# ---------------------------------------------------------------------------
+# Candidate time parameterisation (eq. monotone vs a local offset).
+# ---------------------------------------------------------------------------
+# The document's eq. (monotone) is a GLOBAL cumulative normalisation,
+# hat_t_j = cumsum(softplus r)_j / sum(softplus r). Moving one candidate onto
+# its beat requires a coordinated change of every earlier softplus term and
+# the total, and the per-event gradients through the cumsum cancel: training
+# only the timing head on ONE fixed batch of 8 fragments for 300 full steps
+# left the candidates on the uniform grid (spacing CV 0.07), and 40 real
+# epochs did no better (CV 0.074). "local" anchors candidate j in its own slot
+# and lets it move by up to half a slot, hat_t_j = (j + 0.5 + 0.5 tanh r_j)/N,
+# which is still strictly increasing by construction (each hat_t_j lies in
+# (j/N, (j+1)/N)) and fits the same batch in 60 steps (CV 0.29, every beat
+# inside tolerance). "monotone" keeps the document's construction.
+TIME_REPARAM = "local"
 
 # ---------------------------------------------------------------------------
 # Timing scale b (Section 3.7).
@@ -125,9 +167,53 @@ LAMBDA_R = 0.0
 B_0 = F_MEASURE_TOLERANCE / WINDOW_SECONDS   # 0.07 s / 30 s = 0.002333
 B_MIN = 1e-4                                  # alignbeat/criterion.py:24, same units (window fraction)
 
-# eps-insensitive timing (alignbeat/criterion.py:30, eps_l1): residuals inside
-# the 70 ms tolerance cost nothing, so they cannot drive b_e toward zero.
+# Periodicity regulariser weight, eq. (48) / eq. (53)'s third line.
+#
+# The document makes this a PER-FRAGMENT switch, not a global one: lambda_R is
+# nonzero wherever the track's meter L is annotated, and "set to 0 for that
+# fragment" only where it is not. The code follows that (m_step_loss): fully-
+# labeled fragments use eq. (48) with the annotated bar lengths; beat-only
+# fragments, where the document would zero it, marginalise R over the
+# candidate meters instead (marginal_periodicity), a milder step than the
+# forbidden "incorrect default meter". So this constant is the weight in force
+# wherever R is computable at all. 0.0 disables the term everywhere, which is
+# what AlignBeat runs (its documented --lambda_r flag was never wired up).
+#
+# Scale. R is a squared time in window fractions, so its natural magnitude is
+# tiny: at 120 BPM one beat period is 0.5 s / 30 s = 0.0167, and a downbeat
+# displaced by a whole beat contributes (0.0167)^2 = 2.8e-4 to R. The timing
+# term charges that same one-beat error about (0.0167 - eps) / b_0 = 6 units.
+# Calibrate lambda_R so the two agree at a one-beat error:
+#     lambda_R * DELTA_TYP^2 = DELTA_TYP / B_0   =>   lambda_R = 1 / (B_0 * DELTA_TYP)
+# = 1 / (0.002333 * 0.016667) = 2.6e4. Below one beat the quadratic R is milder
+# than the linear timing term, above it harsher, which is the intended shape.
+# The document gives no value; this is a calibration, not a derivation, and
+# wants its own sweep like lambda_phi. Override with --lambda_r.
+DELTA_TYP = 0.5 / WINDOW_SECONDS              # one beat at 120 BPM, window fraction
+LAMBDA_R = 1.0 / (B_0 * DELTA_TYP)
+
+# The tolerance in the units hat_t lives in (== B_0). Used in two places
+# that AlignBeat ties together but this model must NOT:
 EPS = F_MEASURE_TOLERANCE / WINDOW_SECONDS    # == B_0
+# (1) The normaliser log(2 EPS_NORM + 2 b) of the timing likelihood
+#     (alignbeat/criterion.py _per_candidate_time_term). Bounded below by
+#     log(2 EPS_NORM), which is what keeps b_e from collapsing to 0 --
+#     the document's own M log(2 b) is unbounded and did collapse.
+EPS_NORM = EPS
+# (2) The eps-insensitive DEAD ZONE on the residual (alignbeat eps_l1):
+#     |dt| inside EPS_RESIDUAL costs nothing. AlignBeat can afford it because
+#     its candidates carry a beat/non-beat CLASS; the timing channel only
+#     refines. Here there is no class: the ONLY thing that can separate a
+#     beat candidate from a non-beat one is where hat_t puts it. With a dead
+#     zone of 70 ms, a UNIFORM grid of 188 candidates over 30 s (160 ms apart)
+#     already has a candidate within tolerance of every beat, so the timing
+#     term is ~0 without the model learning anything -- and the cheapest way
+#     for the trunk to emit a uniform grid is identical features for every
+#     candidate, which then cannot carry a phase either. Measured: with the
+#     dead zone the model could not fit ONE batch of 8 fragments in 300 full
+#     steps (phase error stuck at chance, spacing CV 0.004); without it the
+#     phase starts moving. 0 restores the document's |dt| / b residual.
+EPS_RESIDUAL = 0.0
 # AlignBeat's third piece, the Gamma prior on 1/b (_precision_prior), is
 # deliberately not carried over: the two terms above already bound the loss.
 

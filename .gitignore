@@ -8,3 +8,5 @@ wandb/
 *.ckpt
 *.npz
 .vscode/
+sweep_logs/
+sweep_results.csv

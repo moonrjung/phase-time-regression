@@ -104,16 +104,29 @@ def fragment_targets(batch, fps: float, quantize: bool = False):
             phi = phases_from_downbeats(len(beats), db_positions)
             phi_true = torch.as_tensor(phi, dtype=torch.float32, device=device)
             ind = 0
+            # For eq. (48): the annotated downbeats and the bar length between
+            # each consecutive pair, read off the annotation exactly as
+            # phases_from_downbeats does (Section 3.5: on a fully-labeled
+            # track L "could in principle be read off the annotation
+            # directly"). Taken from the annotation, NOT from phi_true == 0:
+            # a beat one bar before the first annotated downbeat also gets
+            # phi = 0 by the extended-first-bar rule, and must not count.
+            downbeat_idx = torch.as_tensor(db_positions, dtype=torch.long, device=device)
+            bar_lengths = (downbeat_idx[1:] - downbeat_idx[:-1]).to(torch.float32)
         else:
             # ind = 1 implies L unknown too (Section 2.5): the two are never
-            # observed independently of one another.
+            # observed independently of one another. No downbeats, no bar
+            # lengths: the E-step treats L as latent for this fragment.
             phi_true, ind = None, 1
+            downbeat_idx, bar_lengths = None, None
 
         targets.append({
             "t_true": torch.as_tensor(beats / window_seconds,
                                       dtype=torch.float32, device=device),
             "ind": ind,
             "phi_true": phi_true,
+            "downbeat_idx": downbeat_idx,     # ind=0 only
+            "bar_lengths": bar_lengths,       # ind=0 only, (K-1,)
         })
     return targets
 
@@ -128,8 +141,9 @@ class PLPhaseTimeRegression(LightningModule):
                  max_epochs: int = config.MAX_EPOCHS,
                  fps: int = config.FPS,
                  lambda_phi: float = config.LAMBDA_PHI,
+                 lambda_phi_mstep: float = config.LAMBDA_PHI_MSTEP,
                  lambda_R: float = config.LAMBDA_R,
-                 beat_only_meter: int = FALLBACK_METER,
+                 meter_candidates: list[int] = tuple(config.METER_CANDIDATES),
                  quantize_targets: bool = False,
                  **model_kwargs):
         super().__init__()
@@ -141,22 +155,25 @@ class PLPhaseTimeRegression(LightningModule):
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
         self.fps = fps
-        self.lambda_phi = lambda_phi
+        self.lambda_phi = lambda_phi                # E-step (matching) weight
+        self.lambda_phi_mstep = lambda_phi_mstep    # M-step (gradient) weight, config.LAMBDA_PHI_MSTEP
         self.lambda_R = lambda_R
         self.quantize_targets = quantize_targets
 
-        # ind = 1 fragments need SOME meter for the hard phi_0 resolution
-        # (eq. 26). The document's own answer is to marginalize over the
-        # candidate set via MixedMeterTarget (Algorithm 1), which is not
-        # implemented here -- so a single meter is assumed and named, rather
-        # than the choice being buried.
-        self.beat_only_meter = beat_only_meter
-        # pi_L (eq. 25) is the empirical distribution of phi_0 given L, which
-        # has to be estimated from the fully-labeled portion of the corpus.
-        # Uniform until that estimate exists; flagged rather than silently
-        # standing in for a measured prior.
-        self.register_buffer("pi_L",
-                             torch.full((beat_only_meter,), 1.0 / beat_only_meter))
+        # ind = 1 fragments carry no meter (Section 2.5), and the eq. (48)
+        # discussion forbids assigning them a default one. The meter is
+        # therefore LATENT for those fragments: e_step resolves phi_0 under
+        # every candidate meter and picks the best by cost - log pi_M(L)
+        # (hard EM over L), while the M-step marginalises the periodicity
+        # term over all of them. The candidate set and its prior are the
+        # document's own pi_M (eq. 4), the same ones inference uses (eq. 67).
+        self.meter_candidates = [int(L) for L in meter_candidates]
+        self.register_buffer("pi_M", torch.tensor(
+            [config.METER_PRIOR[L] for L in self.meter_candidates], dtype=torch.float32))
+        # pi_L (eq. 25), the distribution of phi_0 given L, would have to be
+        # estimated from the fully-labeled part of the corpus. Until that
+        # estimate exists e_step uses a uniform pi_L for every L (its
+        # pi_L=None default), flagged here rather than silently assumed.
 
     def forward(self, spect, epoch=None):
         return self.model(spect, epoch=epoch)
@@ -194,18 +211,22 @@ class PLPhaseTimeRegression(LightningModule):
                 continue
 
             if target["ind"] == 0:
-                hat_sigma, phi_i, unmatched = e_step(
+                hat_sigma, phi_i, unmatched, hyps = e_step(
                     t_true, hat_t[i], hat_phi[i], b_e[i], self.lambda_phi,
                     ind=0, phi_true=target["phi_true"])
             else:
-                hat_sigma, phi_i, unmatched = e_step(
+                hat_sigma, phi_i, unmatched, hyps = e_step(
                     t_true, hat_t[i], hat_phi[i], b_e[i], self.lambda_phi,
-                    ind=1, L=self.beat_only_meter, pi_L=self.pi_L)
+                    ind=1, meter_candidates=self.meter_candidates, pi_M=self.pi_M)
 
+            # eq. (48)'s per-fragment gate: annotated downbeats + bar lengths
+            # for ind=0 (None for ind=1), meter hypotheses for ind=1 (None
+            # for ind=0). m_step_loss applies whichever is present.
             loss = m_step_loss(
                 hat_sigma, phi_i, t_true, hat_t[i], hat_phi[i], b_e[i],
-                self.lambda_phi, unmatched_agree=unmatched,
-                lambda_R=self.lambda_R, downbeat_mask=(phi_i == 0.0))
+                self.lambda_phi, unmatched_agree=unmatched, lambda_R=self.lambda_R,
+                downbeat_idx=target["downbeat_idx"], bar_lengths=target["bar_lengths"],
+                meter_hyps=hyps, lambda_phi_mstep=self.lambda_phi_mstep)
 
             total = total + loss
             used += 1

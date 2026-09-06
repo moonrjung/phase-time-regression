@@ -127,8 +127,9 @@ def main(args):
         max_epochs=args.max_epochs,
         fps=args.fps,
         lambda_phi=args.lambda_phi,
+        lambda_phi_mstep=args.lambda_phi_mstep,
         lambda_R=args.lambda_r,
-        beat_only_meter=args.beat_only_meter,
+        meter_candidates=args.meter_candidates,
         quantize_targets=args.quantize_targets,
         # forwarded to HybridBeatTracker
         spect_dim=args.spect_dim,
@@ -140,6 +141,7 @@ def main(args):
                  "transformer": args.transformer_dropout},
         fragment_frames=args.train_length,
         b_0=args.b_0,
+        time_reparam=args.time_reparam,
         warmup_epochs=int(args.scale_warmup_fraction * args.max_epochs),
 
         
@@ -249,8 +251,17 @@ def build_parser():
                         help="eq. (19): weight on the circular phase term. No "
                              "AlignBeat counterpart -- omega_db weighted a discrete "
                              "class, not a distance. Wants its own sweep.")
+    parser.add_argument("--lambda-phi-mstep", type=float, default=config.LAMBDA_PHI_MSTEP,
+                        help="M-step weight on the phase and agreement terms, i.e. the "
+                             "phase gradient's size against the timing gradient's; "
+                             "--lambda_phi stays the E-step matching weight (config.py)")
+    parser.add_argument("--time-reparam", choices=["local", "monotone"], default=config.TIME_REPARAM,
+                        help="candidate time parameterisation: 'local' per-slot offset "
+                             "(trains), 'monotone' the document's cumsum (config.py)")
     parser.add_argument("--lambda_r", type=float, default=config.LAMBDA_R,
-                        help="eq. (48): periodicity regularizer on downbeat spacing")
+                        help="eq. (48): periodicity regulariser on downbeat spacing, in "
+                             "force wherever R is computable (annotated L, or marginal "
+                             "over meters for beat-only fragments); 0 disables it")
     parser.add_argument("--b_0", type=float, default=config.B_0,
                         help="eq. (51): fixed timing scale during warm-start, in "
                              "normalized [0,1] fragment time")
@@ -259,9 +270,12 @@ def build_parser():
                          "as AlignBeat does (30%% of the run)")
 
     
-    parser.add_argument("--beat-only-meter", type=int, default=4,
-                        help="meter assumed for beat-only (ind=1) fragments, pending "
-                             "MixedMeterTarget (Algorithm 1)")
+    parser.add_argument("--meter-candidates", type=int, nargs="+",
+                        default=config.METER_CANDIDATES,
+                        help="candidate meters L for beat-only (ind=1) fragments, where "
+                             "L is latent: e_step resolves phi_0 under each and the "
+                             "periodicity term is marginalised over them with pi_M "
+                             "(config.METER_PRIOR). Same set inference uses.")
     parser.add_argument("--quantize-targets", default=False, action="store_true",
                         help="round ground-truth times to the frame grid, as the dense "
                              "head is necessarily trained on")
