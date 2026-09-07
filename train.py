@@ -130,6 +130,7 @@ def main(args):
         lambda_R=args.lambda_r,
         meter_candidates=args.meter_candidates,
         quantize_targets=args.quantize_targets,
+        strip_downbeats=tuple(args.strip_downbeats),
         # forwarded to HybridBeatTracker
         spect_dim=args.spect_dim,
         transformer_dim=args.transformer_dim,
@@ -175,7 +176,7 @@ def main(args):
         logger=logger,
         callbacks=callbacks,
         log_every_n_steps=1,
-        precision="16-mixed",
+        precision=args.precision,
         gradient_clip_val=args.gradient_clip_val or None,
         accumulate_grad_batches=args.accumulate_grad_batches,
         check_val_every_n_epoch=args.val_frequency,
@@ -254,6 +255,15 @@ def build_parser():
     parser.add_argument("--lambda-phi-estep", type=float, default=config.LAMBDA_PHI_ESTEP,
                         help="pin the E-step (matching) phase weight to this value instead "
                              "of the fragment's 1 / b_phi; default None = 1 / b_phi")
+    parser.add_argument("--precision", default="bf16-mixed",
+                        choices=["bf16-mixed", "16-mixed", "32-true"],
+                        help="bf16-mixed by default, NOT upstream's 16-mixed: this loss's "
+                             "gradients (norm ~2e3 early, 1/b_e and 1/b_phi slopes) overflow "
+                             "fp16 under the GradScaler's multiplier, so under 16-mixed every "
+                             "optimizer step was skipped as non-finite and the weights never "
+                             "moved (measured 2026-09-06: 0.03%% drift in 5 epochs, ~1%% in 40). "
+                             "bf16 has fp32's exponent range and needs no scaler; the probe's "
+                             "trajectory matched 32-true step for step")
     parser.add_argument("--gradient-clip-val", type=float, default=0.0,
                         help="clip gradient norm (0 = off, the upstream default). The phase "
                              "weight 1/b_phi can reach 1/B_PHI_MIN; two 2026-09-06 runs "
@@ -280,6 +290,11 @@ def build_parser():
                              "L is latent: e_step resolves phi_0 under each and the "
                              "periodicity term is marginalised over them with pi_M "
                              "(config.METER_PRIOR). Same set inference uses.")
+    parser.add_argument("--strip-downbeats", type=str, nargs="*", default=[],
+                        help="dataset names (as in data/annotations/, e.g. ballroom harmonix) "
+                             "or 'all': train as if these had NO downbeat annotation "
+                             "(beat-only, ind=1). Evaluation still uses the real downbeats, "
+                             "so this measures downbeats learned without downbeat labels.")
     parser.add_argument("--quantize-targets", default=False, action="store_true",
                         help="round ground-truth times to the frame grid, as the dense "
                              "head is necessarily trained on")

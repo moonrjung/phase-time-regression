@@ -74,8 +74,16 @@ def phases_from_downbeats(n_beats: int, downbeat_positions: np.ndarray,
     return phi
 
 
-def fragment_targets(batch, fps: float, quantize: bool = False):
+def fragment_targets(batch, fps: float, quantize: bool = False,
+                     strip_downbeats: tuple = ()):
     """batch -> one (t_true, ind, phi_true) per fragment.
+
+    strip_downbeats: dataset names (or "all") whose pieces are to be treated
+    as BEAT-ONLY (ind=1) even though their annotation has downbeats. This is
+    the "pretend it is beat-only" experiment: train without a dataset's
+    downbeats, then score downbeats on its held-out pieces with the real
+    annotation, which evaluate.py still reads. Beat This! has no route from
+    beat-only data to downbeats; this model has the latent phi_0 / meter.
 
     Mirrors PLBeatThis._subset_targets exactly on everything the two share --
     the same annotation fields, the same (0, 1] window, the same uniqueness
@@ -91,6 +99,10 @@ def fragment_targets(batch, fps: float, quantize: bool = False):
         beats = np.frombuffer(batch["truth_orig_beat"][index])
         downbeats = np.frombuffer(batch["truth_orig_downbeat"][index])
         has_downbeats = bool(batch["downbeat_mask"][index])
+        if strip_downbeats:
+            corpus = str(batch["spect_path"][index]).split("/", 1)[0]
+            if "all" in strip_downbeats or corpus in strip_downbeats:
+                has_downbeats = False
 
         # eq. (1) maps onto the half-open axis (0, 1], so an event at exactly 0
         # is unreachable by construction -- same filter PLBeatThis applies.
@@ -144,6 +156,7 @@ class PLPhaseTimeRegression(LightningModule):
                  lambda_R: float = config.LAMBDA_R,
                  meter_candidates: list[int] = tuple(config.METER_CANDIDATES),
                  quantize_targets: bool = False,
+                 strip_downbeats: tuple = (),
                  **model_kwargs):
         super().__init__()
         self.save_hyperparameters()
@@ -160,6 +173,10 @@ class PLPhaseTimeRegression(LightningModule):
         self.lambda_phi_estep = lambda_phi_estep
         self.lambda_R = lambda_R
         self.quantize_targets = quantize_targets
+        # Applied to the training AND validation loss, so the validation loss
+        # measures the same beat-only objective; downbeat METRICS come from
+        # evaluate.py, which always uses the real annotation.
+        self.strip_downbeats = tuple(strip_downbeats)
 
         # ind = 1 fragments carry no meter (Section 2.5), and the eq. (48)
         # discussion forbids assigning them a default one. The meter is
@@ -183,7 +200,15 @@ class PLPhaseTimeRegression(LightningModule):
         # epoch, not None: None means "ScaleHead is already trained", which
         # would skip eq. (51)'s warm-start entirely for the whole run.
         hat_phi, hat_t, b_e, b_phi = self.model(batch["spect"], epoch=self.current_epoch)
-        targets = fragment_targets(batch, self.fps, self.quantize_targets)
+        # Everything from here on is the E-step and the loss, kept in fp32
+        # outside autocast (Lightning wraps the whole training_step in it).
+        # This is hygiene, not the fix for the 2026-09-06 stall: that was fp16
+        # RANGE in the backward -- see --precision in train.py, bf16 by default.
+        with torch.autocast(device_type=hat_t.device.type, enabled=False):
+            return self._loss_fp32(batch, hat_phi, hat_t, b_e, b_phi)
+
+    def _loss_fp32(self, batch, hat_phi, hat_t, b_e, b_phi):
+        targets = fragment_targets(batch, self.fps, self.quantize_targets, self.strip_downbeats)
 
         N = hat_t.shape[1]
         total, used, skipped, nonfinite = 0.0, 0, 0, 0
@@ -259,6 +284,21 @@ class PLPhaseTimeRegression(LightningModule):
                  prog_bar=stats["nonfinite"] > 0)
         return loss
 
+    def on_before_optimizer_step(self, optimizer):
+        # Under bf16 there is no GradScaler, so nothing skips a step whose
+        # gradients are non-finite, and ONE such step leaves NaN in the weights
+        # for good (a 40-epoch run on 2026-09-06 died inside epoch 0 this way,
+        # with the same seed and data order as a run that survived). Drop the
+        # step instead: Adam ignores parameters whose .grad is None, and the
+        # count is logged so a run that hits this often is visible.
+        grads = [p.grad for p in self.parameters() if p.grad is not None]
+        finite = all(bool(torch.isfinite(g).all()) for g in grads)
+        self.log("train_nonfinite_steps", 0.0 if finite else 1.0, prog_bar=not finite,
+                 on_step=True, on_epoch=False, reduce_fx="sum")
+        if not finite:
+            for p in self.parameters():
+                p.grad = None
+
     def validation_step(self, batch, batch_idx):
         loss, stats = self._compute_loss(batch)
         if loss is None:
@@ -271,8 +311,17 @@ class PLPhaseTimeRegression(LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr,
                                       weight_decay=self.weight_decay)
-        scheduler = CosineWarmupScheduler(
-            optimizer, self.warmup_steps, self.trainer.estimated_stepping_batches)
+        # The warm-up is counted in optimizer steps (AlignBeat's 1000, i.e.
+        # 5% of a 100-epoch run). A short run must not spend itself inside
+        # the warm-up: a 5-epoch debug run has 945 steps, and with warmup=1000
+        # the cosine had decayed to ZERO before the ramp ended -- lr 0.0 at the
+        # end, weights moved 0.03% in five epochs. Cap it at 10% of the run.
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        warmup = min(self.warmup_steps, max(total_steps // 10, 1))
+        if warmup < self.warmup_steps:
+            print(f"warm-up capped at {warmup} of {total_steps} optimizer steps "
+                  f"(--warmup-steps {self.warmup_steps} exceeds 10% of the run)")
+        scheduler = CosineWarmupScheduler(optimizer, warmup, total_steps)
         return {"optimizer": optimizer,
                 "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
 

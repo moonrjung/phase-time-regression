@@ -136,6 +136,19 @@ TAU_PRIME = 1.5 * TAU        # 0.3
 # would charge 8 nats and huge gradients per event.
 B_PHI_0 = 0.03
 B_PHI_MIN = 1e-3
+# Ceiling on the learned b_phi (ScaleHead b_max). At b_phi = 0.15 the wrapped
+# Laplace's density ratio between an exact hit and a half-turn miss is only
+# e^(0.5/0.15) ~ 28 and Z = 0.29; beyond that the likelihood is nearly flat
+# and its gradient 1 / b_phi too small to teach the phase head anything. Set
+# so the phase channel can soften while predictions are poor (the appendix's
+# early-training argument) but can never switch itself off.
+# Measured need (2026-09-06, two uncapped 40-epoch runs): the phase error fell
+# from 0.25 to 0.10 during the 12-epoch hold, then at the hand-over the head
+# drove b_phi from 0.03 to 0.79 and 5.5 within two epochs, the slope 1/b_phi
+# collapsed, and the phase error returned to chance for the rest of the run.
+# The first capped run died of an unrelated non-finite step in epoch 0 (now
+# caught by on_before_optimizer_step), not of the ceiling.
+B_PHI_MAX = 0.15
 
 # The appendix uses the single scale 1/b_phi in the E-step (matching) as well
 # as in the loss. None here does exactly that. A float pins the E-step weight

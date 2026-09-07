@@ -106,7 +106,8 @@ class HybridBeatTracker(nn.Module):
         # Same construction for the phase scale b_phi (appendix: the learned
         # scale + log-scale restoration applied symmetrically to every term).
         self.phase_scale_head = ScaleHead(reduced_dim, scale_hidden,
-                                          b_min=config.B_PHI_MIN, b_init=b_phi_0)
+                                          b_min=config.B_PHI_MIN, b_init=b_phi_0,
+                                          b_max=config.B_PHI_MAX)
         self.b_0 = b_0
         self.b_phi_0 = b_phi_0
         self.warmup_epochs = warmup_epochs

@@ -194,9 +194,19 @@ class ScaleHead(nn.Module):
     whole fragment, not of any one candidate."""
 
     def __init__(self, d_model: int, hidden: int = 128, b_min: float = 1e-3,
-                 b_init: float = config.B_0):
+                 b_init: float = config.B_0, b_max: float | None = None):
         super().__init__()
         self.b_min = b_min
+        # b_max=None: b = softplus(raw) + b_min, unbounded above (timing).
+        # b_max given: b = b_min + (b_max - b_min) sigmoid(raw), used for the
+        # PHASE scale. Why phase needs a ceiling: the wrapped Laplace becomes
+        # uniform as b_phi grows (Z -> 1, -log p -> 0 for every residual), so
+        # while the phase predictions are still at chance the MLE of b_phi is
+        # infinity, and there the phase gradient 1 / b_phi vanishes and the
+        # phase head can never improve. Measured 2026-09-06: after a 2-epoch
+        # hold the head drove b_phi to 1.2 and 4.0 (the circle is 0.5 wide)
+        # and the phase error stayed at chance for the rest of the run.
+        self.b_max = b_max
         self.net = nn.Sequential(
             nn.Linear(d_model, hidden),
             nn.GELU(),
@@ -212,12 +222,18 @@ class ScaleHead(nn.Module):
         last = self.net[-1]
         nn.init.zeros_(last.weight)
         target = max(b_init - b_min, 1e-6)
-        nn.init.constant_(last.bias, math.log(math.expm1(target)))
+        if b_max is None:
+            nn.init.constant_(last.bias, math.log(math.expm1(target)))          # softplus^-1
+        else:
+            frac = min(max(target / (b_max - b_min), 1e-6), 1 - 1e-6)
+            nn.init.constant_(last.bias, math.log(frac / (1.0 - frac)))         # sigmoid^-1
 
     def forward(self, z_bar: torch.Tensor) -> torch.Tensor:
         # z_bar: (batch, d_model) -> b_e: (batch,), always > b_min
         raw = self.net(z_bar).squeeze(-1)
-        return F.softplus(raw) + self.b_min
+        if self.b_max is None:
+            return F.softplus(raw) + self.b_min
+        return self.b_min + (self.b_max - self.b_min) * torch.sigmoid(raw)
 
 
 def mean_pool_candidates(z: torch.Tensor) -> torch.Tensor:
